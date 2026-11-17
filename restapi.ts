@@ -103,50 +103,18 @@ function userJson(login: string): Record<string, unknown> {
   };
 }
 
-/** GitHub's repository JSON. */
-function repoJson(call: ApiCall, repo: Repo): Record<string, unknown> {
-  const base = `${call.origin}/api/v3`;
+/**
+ * GitHub's repository JSON, cut to the fields the suite reads: the create/read checks take name,
+ * private, default_branch and description, and the MCP parity check takes id and full_name.
+ */
+function repoJson(repo: Repo): Record<string, unknown> {
   return {
     id: repo.id,
-    node_id: `R_${repo.id}`,
     name: repo.name,
     full_name: `${repo.owner}/${repo.name}`,
     private: repo.isPrivate,
-    owner: userJson(repo.owner),
-    html_url: `${call.origin}/${repo.owner}/${repo.name}`,
     description: repo.description,
-    fork: false,
-    url: `${base}/repos/${repo.owner}/${repo.name}`,
-    archive_url: `${base}/repos/${repo.owner}/${repo.name}/{archive_format}{/ref}`,
-    contents_url: `${base}/repos/${repo.owner}/${repo.name}/contents/{+path}`,
-    issues_url: `${base}/repos/${repo.owner}/${repo.name}/issues{/number}`,
-    branches_url: `${base}/repos/${repo.owner}/${repo.name}/branches{/branch}`,
     default_branch: repo.defaultBranch,
-    created_at: STATE_EPOCH_ISO,
-    updated_at: STATE_EPOCH_ISO,
-    pushed_at: STATE_EPOCH_ISO,
-    size: 0,
-    language: null,
-    visibility: repo.isPrivate ? 'private' : 'public',
-    has_issues: true,
-    has_wiki: false,
-    has_pages: false,
-    has_projects: false,
-    archived: false,
-    disabled: false,
-    open_issues_count: repo.issues.size,
-    open_issues: repo.issues.size,
-    forks_count: 0,
-    forks: 0,
-    stargazers_count: 0,
-    watchers_count: 0,
-    watchers: 0,
-    subscribers_count: 0,
-    network_count: 0,
-    size_kb: 0,
-    topics: [],
-    license: null,
-    permissions: { admin: true, maintain: true, push: true, triage: true, pull: true },
   };
 }
 
@@ -481,13 +449,13 @@ export function handleApi(call: ApiCall, forge: Forge): ApiReply {
   const repo = found;
 
   if (fourth === undefined) {
-    if (call.method === 'GET') return ok(200, repoJson(call, repo));
+    if (call.method === 'GET') return ok(200, repoJson(repo));
     if (call.method === 'PATCH') {
       const body = parseJsonBody(call);
       const description = asString(body.description);
       if (description !== undefined) repo.description = description;
       if (typeof body.private === 'boolean') repo.isPrivate = body.private;
-      return ok(200, repoJson(call, repo));
+      return ok(200, repoJson(repo));
     }
     if (call.method === 'DELETE') {
       forge.remove(repo.owner, repo.name);
@@ -598,7 +566,7 @@ export function handleApi(call: ApiCall, forge: Forge): ApiReply {
     if (pull === undefined) return notFound();
     if (rest.length === 1) {
       if (call.method !== 'GET') return notFound();
-      return ok(200, pullJson(call, repo, pull));
+      return ok(200, pullJson(pull));
     }
     if (rest[1] === 'files' && rest.length === 2) {
       if (call.method !== 'GET') return notFound();
@@ -670,7 +638,7 @@ function createRepo(call: ApiCall, forge: Forge): ApiReply {
     isPrivate: body.private === true,
   });
   if (created === null) return ok(422, { message: 'Repository creation failed. Name already exists on this account', errors: [{ resource: 'Repository', code: 'custom', field: 'name' }] });
-  return ok(201, repoJson(call, created));
+  return ok(201, repoJson(created));
 }
 
 function listRepos(call: ApiCall, forge: Forge): ApiReply {
@@ -687,7 +655,7 @@ function listRepos(call: ApiCall, forge: Forge): ApiReply {
   if (page > 1) links.push(`<${target(page - 1)}>; rel="prev"`, `<${target(1)}>; rel="first"`);
   const headers: Record<string, string> = {};
   if (links.length > 0) headers.link = links.join(', ');
-  return ok(200, slice.map((repo) => repoJson(call, repo)), headers);
+  return ok(200, slice.map((repo) => repoJson(repo)), headers);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -894,51 +862,22 @@ function pullFiles(repo: Repo, pull: Pull): unknown[] {
   return files;
 }
 
-function pullJson(call: ApiCall, repo: Repo, pull: Pull): Record<string, unknown> {
-  const base = `${call.origin}/api/v3/repos/${repo.owner}/${repo.name}`;
-  const side = (ref: string, sha: string): Record<string, unknown> => ({
-    label: `${repo.owner}:${ref}`,
-    ref,
-    sha,
-    user: userJson(repo.owner),
-    repo: { id: repo.id, name: repo.name, full_name: `${repo.owner}/${repo.name}`, private: repo.isPrivate },
-  });
+/**
+ * A pull request as the suite reads it: number, state, title and body (its shape), head/base refs
+ * and shas, and the three merge fields the merge checks read (merged, merged_at, merge_commit_sha).
+ */
+function pullJson(pull: Pull): Record<string, unknown> {
   return {
     id: pull.id,
-    node_id: `PR_${pull.id}`,
     number: pull.number,
     state: pull.state,
     title: pull.title,
     body: pull.body,
-    draft: false,
-    locked: false,
     merged: pull.merged,
-    mergeable: true,
-    mergeable_state: 'clean',
     merged_at: pull.mergedAt,
     merge_commit_sha: pull.mergeCommitSha,
-    head: side(pull.headRef, pull.headSha),
-    base: side(pull.baseRef, pull.baseSha),
-    user: userJson(repo.owner),
-    assignee: null,
-    assignees: [],
-    milestone: null,
-    labels: [],
-    requested_reviewers: [],
-    comments: 0,
-    review_comments: 0,
-    commits: 1,
-    additions: 0,
-    deletions: 0,
-    changed_files: 0,
-    created_at: STATE_EPOCH_ISO,
-    updated_at: STATE_EPOCH_ISO,
-    closed_at: pull.state === 'closed' ? STATE_EPOCH_ISO : null,
-    url: `${base}/pulls/${pull.number}`,
-    html_url: `${call.origin}/${repo.owner}/${repo.name}/pull/${pull.number}`,
-    diff_url: `${call.origin}/${repo.owner}/${repo.name}/pull/${pull.number}.diff`,
-    patch_url: `${call.origin}/${repo.owner}/${repo.name}/pull/${pull.number}.patch`,
-    statuses_url: `${base}/statuses/${pull.headSha}`,
+    head: { ref: pull.headRef, sha: pull.headSha },
+    base: { ref: pull.baseRef, sha: pull.baseSha },
   };
 }
 
@@ -974,7 +913,7 @@ function createPull(call: ApiCall, repo: Repo, forge: Forge): ApiReply {
     mergedAt: null,
   };
   repo.pulls.set(number, pull);
-  return ok(201, pullJson(call, repo, pull));
+  return ok(201, pullJson(pull));
 }
 
 function listPulls(call: ApiCall, repo: Repo): ApiReply {
@@ -984,7 +923,7 @@ function listPulls(call: ApiCall, repo: Repo): ApiReply {
   let list = [...repo.pulls.values()];
   if (state !== 'all') list = list.filter((pull) => pull.state === state);
   list.sort((a, b) => b.number - a.number);
-  return ok(200, list.slice((page - 1) * perPage, page * perPage).map((pull) => pullJson(call, repo, pull)));
+  return ok(200, list.slice((page - 1) * perPage, page * perPage).map((pull) => pullJson(pull)));
 }
 
 /** Replay the head's changes onto the base tree; the paths that changed on both sides are conflicts. */

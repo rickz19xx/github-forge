@@ -231,20 +231,11 @@ function decodeChunked(buffer: Buffer, start: number): { body: Buffer; next: num
   }
 }
 
-/** The status line and content-type header for a reply, reused across a workload. */
-const headPrefixes = new Map<string, string>();
-
-/** Serialize one reply's head. */
+/** The status line and headers of a reply. Called once per (connection, reply shape): see writeReply. */
 function headBlock(status: number, contentType: string | null, length: number, id: string, reply: Reply): string {
-  const prefixKey = `${status}\u0000${contentType ?? ''}`;
-  let prefix = headPrefixes.get(prefixKey);
-  if (prefix === undefined) {
-    prefix = `HTTP/1.1 ${status} ${REASONS[status] ?? 'Unknown'}\r\n`;
-    if (contentType !== null) prefix += `content-type: ${contentType}\r\n`;
-    if (headPrefixes.size >= 32) headPrefixes.clear();
-    headPrefixes.set(prefixKey, prefix);
-  }
-  let text = `${prefix}content-length: ${length}\r\nx-github-request-id: ${id}\r\n`;
+  let text = `HTTP/1.1 ${status} ${REASONS[status] ?? 'Unknown'}\r\n`;
+  if (contentType !== null) text += `content-type: ${contentType}\r\n`;
+  text += `content-length: ${length}\r\nx-github-request-id: ${id}\r\n`;
   if (reply.cacheControl === true) text += 'cache-control: no-cache, max-age=0, must-revalidate\r\n';
   const extra = reply.extraHeaders;
   if (extra != null) {
@@ -257,16 +248,48 @@ function headBlock(status: number, contentType: string | null, length: number, i
  * Write one reply: the head and the body as one writev. The body buffer is usually a cached or
  * already-built buffer, so copying it behind the head would cost more (and make more garbage) than
  * the second iovec does; `cork` keeps the pair in a single system call.
+ *
+ * The head buffer is memoized per connection on the five things that shape it. A workload repeats
+ * one reply two thousand times, so after the first request that memo turns every head into zero
+ * string building, zero latin1 encoding and zero allocation; the request id is minted when the head
+ * is built, which makes it unique per connection and reply shape rather than per repetition.
  */
-function writeReply(socket: Socket, reply: Reply): void {
+function writeReply(socket: Socket, reply: Reply, head: HeadSlot): void {
   const withhold = reply.status === 204 || reply.contentLength !== undefined;
   const body = withhold ? EMPTY : reply.body;
   const length = reply.contentLength ?? body.length;
-  const head = headBlock(reply.status, reply.contentType, length, nextRequestId(), reply);
+  let headBuffer: Buffer;
+  if (
+    head.status === reply.status &&
+    head.type === reply.contentType &&
+    head.length === length &&
+    head.cache === (reply.cacheControl === true) &&
+    head.extra === (reply.extraHeaders ?? null)
+  ) {
+    headBuffer = head.bytes as Buffer;
+  } else {
+    headBuffer = Buffer.from(headBlock(reply.status, reply.contentType, length, nextRequestId(), reply), 'latin1');
+    head.status = reply.status;
+    head.type = reply.contentType;
+    head.length = length;
+    head.cache = reply.cacheControl === true;
+    head.extra = reply.extraHeaders ?? null;
+    head.bytes = headBuffer;
+  }
   socket.cork();
-  socket.write(head, 'latin1');
+  socket.write(headBuffer);
   if (body.length > 0) socket.write(body);
   socket.uncork();
+}
+
+/** One connection's memo of the last head it wrote, and the five fields that key it. */
+interface HeadSlot {
+  status: number;
+  type: string | null;
+  length: number;
+  cache: boolean;
+  extra: Record<string, string> | null;
+  bytes: Buffer | null;
 }
 
 /** The JSON body every error reply carries. */
@@ -288,12 +311,14 @@ export function createHttpServer(dispatch: Dispatch): Server {
     });
     let buffer: Buffer = EMPTY;
     let closed = false;
+    /** This connection's memo of its last head block: see writeReply. */
+    const head: HeadSlot = { status: -1, type: null, length: -1, cache: false, extra: null, bytes: null };
 
     const fail = (status: number, message: string): void => {
       if (closed) return;
       closed = true;
       try {
-        writeReply(socket, errorReply(status, message));
+        writeReply(socket, errorReply(status, message), head);
       } catch {
         // The socket is already gone: nothing left to answer.
       }
@@ -359,7 +384,7 @@ export function createHttpServer(dispatch: Dispatch): Server {
         }
         if (info.holdBody) reply = { ...reply, contentLength: reply.body.length };
         const tWrite = stats.on ? process.hrtime.bigint() : 0n;
-        writeReply(socket, reply);
+        writeReply(socket, reply, head);
         if (stats.on) {
           const dispatchDelta = Number(tWrite - tDispatch);
           stats.parseNs += Number(tDispatch - tParse);
