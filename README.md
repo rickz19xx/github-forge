@@ -40,15 +40,15 @@ disk.
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags="-s -w" -o forge ./go
 ```
 
-For a local grade on Windows, the kit's process driver snapshots the worktree's tracked and
-untracked (not ignored) files, so the git-ignored test build has to be named in the index for that
-one run:
+For a local grade on Windows, `--worktree` snapshots the worktree with `git add --all`, so a
+git-ignored `forge.exe` is left out and the entry cannot start. Let it into that one snapshot:
 
 ```sh
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o forge.exe ./go
-git add -N -f forge.exe
-cd ../ghkit && cmd.exe /c grade.bat --worktree
-git reset -- forge.exe
+cp .gitignore .gitignore.keep
+grep -v '^forge\.exe$' .gitignore.keep > .gitignore
+(cd ../ghkit && cmd.exe /c grade.bat --worktree)
+mv .gitignore.keep .gitignore
 ```
 
 `-buildvcs=false` keeps the binary reproducible (a VCS stamp embeds the build's own clock); the
