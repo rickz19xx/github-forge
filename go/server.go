@@ -125,9 +125,9 @@ type response struct {
 
 // Server owns the store and answers requests.
 type Server struct {
-	forge   *Forge
-	token   []byte
-	idCount uint64
+	forge    *Forge
+	token    []byte
+	idCount  uint64
 	stats    bool
 	builds   atomic.Uint64
 	hits     atomic.Uint64

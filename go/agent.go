@@ -1135,9 +1135,15 @@ var mcpServerInfo = map[string]any{
 
 // mcpToolsJSON is the tools/list result's payload, built once so two answers match byte for byte.
 var mcpToolsJSON = func() []byte {
-	text := func(description string) map[string]any { return map[string]any{"type": "string", "description": description} }
-	boolean := func(description string) map[string]any { return map[string]any{"type": "boolean", "description": description} }
-	integer := func(description string) map[string]any { return map[string]any{"type": "integer", "description": description} }
+	text := func(description string) map[string]any {
+		return map[string]any{"type": "string", "description": description}
+	}
+	boolean := func(description string) map[string]any {
+		return map[string]any{"type": "boolean", "description": description}
+	}
+	integer := func(description string) map[string]any {
+		return map[string]any{"type": "integer", "description": description}
+	}
 	schema := func(properties map[string]any, required []string) map[string]any {
 		return map[string]any{"type": "object", "properties": properties, "required": required, "additionalProperties": false}
 	}
