@@ -231,7 +231,7 @@ function decodeChunked(buffer: Buffer, start: number): { body: Buffer; next: num
   }
 }
 
-/** The status line and headers of a reply. Called once per (connection, reply shape): see writeReply. */
+/** The status line and headers of a reply, as one string for writeReply to encode. */
 function headBlock(status: number, contentType: string | null, length: number, id: string, reply: Reply): string {
   let text = `HTTP/1.1 ${status} ${REASONS[status] ?? 'Unknown'}\r\n`;
   if (contentType !== null) text += `content-type: ${contentType}\r\n`;
