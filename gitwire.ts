@@ -419,14 +419,40 @@ function handleFetch(repo: Repo, args: readonly string[]): Buffer {
   return Buffer.concat(sections);
 }
 
+/**
+ * The answer cache: a clone repeats the same request for the same refs, and building the same packfile
+ * twice is wasted work. The key carries the request bytes and a digest of every ref the repository holds,
+ * so any push that moves a ref misses the cache instead of serving a stale pack.
+ */
+const ANSWER_CACHE_LIMIT = 64;
+const answerCache = new Map<string, Buffer>();
+
+/** A digest of the repository's refs: any ref move changes it. */
+function refDigest(repo: Repo): string {
+  const parts: string[] = [];
+  for (const name of [...repo.refs.keys()].sort()) parts.push(`${name}=${repo.refs.get(name) ?? ''}`);
+  return parts.join('\n');
+}
+
 /** POST /:owner/:repo.git/git-upload-pack. */
 export function handleUploadPack(repo: Repo, body: Buffer): WireResponse {
   const request = parseV2Request(body);
+  if (request.command === 'fetch') {
+    const key = `${repo.id}\u0000${refDigest(repo)}\u0000${body.toString('latin1')}`;
+    const cached = answerCache.get(key);
+    if (cached !== undefined) return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: cached };
+    const answer = handleFetch(repo, request.args);
+    // One entry is one packfile: keep a single one from eating the pod's memory.
+    if (answer.length > 1_048_576) return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: answer };
+    if (answerCache.size >= ANSWER_CACHE_LIMIT) {
+      const oldest = answerCache.keys().next();
+      if (!oldest.done) answerCache.delete(oldest.value);
+    }
+    answerCache.set(key, answer);
+    return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: answer };
+  }
   if (request.command === 'ls-refs') {
     return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: handleLsRefs(repo, request.args) };
-  }
-  if (request.command === 'fetch') {
-    return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: handleFetch(repo, request.args) };
   }
   throw new WireError(`unknown upload-pack command ${JSON.stringify(request.command ?? '')}`);
 }
