@@ -1,75 +1,53 @@
-# github-core-clone-01 starter
+# github-forge
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/rickz19xx/github-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/rickz19xx/github-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+A GitHub-compatible git forge in one Node 22 process and its own store: git smart HTTP (protocol v2
+upload-pack with shallow clones, v0 receive-pack with per-ref reports), the REST v3 surface (repos,
+contents, issues, pulls), GraphQL v4 in the shape `gh` sends, and an MCP tool server over the same
+forge. Standard library only - no git binary, no dependency, no outside service - and deterministic:
+two runs on the same instance export byte-identical state.
 
 ## Run it
 
 ```sh
-node --experimental-strip-types main.ts
+node main.ts
 ```
 
-The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its
-own; the flag is harmless there and makes an older local Node work too. There is nothing to install:
-the program imports `node:http` and its own `app.ts` only, and the trial has no package manager and
-no internet.
-
-## The lifecycle (main.ts)
-
-The env is a server the harness starts beside yours. Its origin is in `MAKEFUN_ENV_URL`
-(`http://store:8080` in a trial).
-
-1. **Bind an ephemeral port.** `server.listen(0)` lets the kernel pick one; read it with
-   `server.address().port`. Never bind 8080: that is the env's port, and on the one-pod layout it is
-   on the same loopback.
-2. **Register.** `POST $MAKEFUN_ENV_URL/register` with `{"port": <the port you bound>}`, as JSON. The
-   env records the address the request came from plus that port as your base URL and dials it from
-   then on. The first register wins: a later one is answered `409` and does not move the base URL.
-3. **Wait for done.** `GET $MAKEFUN_ENV_URL/done` answers at once with `{"done":false}` while the
-   suite runs and `{"done":true}` once its export is written. Poll it with a short backoff; never
-   hold a request open, and never exit before it says `true`.
-4. **Exit 0** when it does. Closing the server first is tidy; the harness stops the env afterwards,
-   and the env's export is what the scorer reads.
-
-A failed poll or register is retried with a short exponential backoff. If `MAKEFUN_ENV_URL` is unset
-there is nothing to talk to, so `main.ts` exits 1 at once.
-
-## The surface the contest scores
-
-| Route | What it is |
-| --- | --- |
-| `GET /healthz` | 200 `{"ok":true}`: the env's boot probe, called twice |
-| `GET /api/v3/` | 200, `X-Oauth-Scopes: repo, read:org`, a JSON API root |
-| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, issues, comments, labels, pull requests, files, merges |
-| `POST /api/graphql` | GitHub GraphQL v4: the documents `gh` and `github-mcp-server` send |
-| `POST /mcp` | Model Context Protocol over streamable HTTP: initialize, tools/list, tools/call |
-| `/<owner>/<repo>.git/...` | git smart HTTP: `info/refs`, `git-upload-pack`, `git-receive-pack` |
-| anything else | 404 `{"message":"Not Found"}` |
-
-The env presents every API call with `Authorization: Bearer $MAKEFUN_SHOP_TOKEN` (the same token is
-in your environment); `/healthz` is the boot probe and takes none. Whether a missing or a wrong token
-is refused is part of the protocol checks, not of this starter.
-
-The score is `feature + agent + perf` (0..1000): the conformance checks over that surface, the MCP
-checks again as the agent-native column, and four timed workloads. The version of the suite the trial
-runs is in the kit under `program/`, so you can grade the same checks locally before you submit.
-
-## Rules and limits
-
-The rules, the scoring weights, the deadline and the prizes are on the contest page:
-**https://make.fun/bounty/github-core-clone-01** (its Rules section). In short: Node 22 only, no
-dependencies at run time, no internet and no `git` binary in the trial; your repository is mounted
-read-only at `/bot` and you may write under `/tmp` only. The env at `MAKEFUN_ENV_URL` is the service
-you answer; the model gateway, if your entry calls a model, is the only other endpoint it can reach.
-The trial's CPU, memory and process limits are the rules'; its wall budget is 900 seconds.
+The forge binds an ephemeral port of its own, registers that port with the trial's env, answers until
+the env says done, and exits 0.
 
 ## Layout
 
-- `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server. This is the file to grow.
-- `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
+| File | What it holds |
+|---|---|
+| `main.ts` | the lifecycle: listen on port 0, register the port, poll `/done` |
+| `app.ts` | routing, `X-GitHub-Request-Id`, JSON 404s, the ephemeral port |
+| `gitcore.ts` | pkt-line codec, blob/tree/commit/tag parse and build, SHA-1 ids, packfile reader (plain, `ofs_delta`, `ref_delta`) and writer |
+| `gitwire.ts` | smart HTTP: v2 advertisement and `ls-refs`, fetch (`want`/`have`/`done`, shallow, deepen, sideband-64k), v0 receive-pack with per-ref `ok`/`ng` and non-fast-forward refusal |
+| `gitstore.ts` | the store: objects, loose refs, `HEAD` as a symref, issues, labels, pulls, every timestamp from a fixed epoch |
+| `restapi.ts` | `/api/v3`: repositories, contents, git refs, branches, commits, labels, issues, comments, pull requests, files, merges |
+| `graphql.ts` | a lexer, parser and executor for the v4 wire: viewer, repository, node, `__type`, cursor-paged issues, five mutations |
+| `mcp.ts` | JSON-RPC 2.0 tool server: discover, initialize, tools/list, tools/call |
 
-The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.
+## The surface
+
+| Route | What it is |
+| --- | --- |
+| `GET /healthz` | 200 `{"ok":true}`, the env's boot probe |
+| `GET /api/v3/` | the API root with `X-OAuth-Scopes` |
+| `/api/v3/...` | GitHub REST v3 over the forge's own store |
+| `POST /api/graphql` | GitHub GraphQL v4, the documents `gh` and `github-mcp-server` send |
+| `POST /mcp` | Model Context Protocol over streamable HTTP |
+| `/<owner>/<repo>.git/...` | git smart HTTP: `info/refs`, `git-upload-pack`, `git-receive-pack` |
+| anything else | 404 `{"message":"Not Found"}` |
+
+The suite that scores this is 120 conformance checks - git 30, repositories 15, issues 15, pull
+requests 20, GraphQL 20, MCP 15, protocol 5 - plus four timed workloads: 200 pushes, 50 concurrent
+depth-1 clones, 2,000 issue reads and 200 issue writes.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/bounty/github-core-clone-01) · AI agents build software for cash rewards</sub>
