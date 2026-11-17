@@ -248,48 +248,16 @@ function headBlock(status: number, contentType: string | null, length: number, i
  * Write one reply: the head and the body as one writev. The body buffer is usually a cached or
  * already-built buffer, so copying it behind the head would cost more (and make more garbage) than
  * the second iovec does; `cork` keeps the pair in a single system call.
- *
- * The head buffer is memoized per connection on the five things that shape it. A workload repeats
- * one reply two thousand times, so after the first request that memo turns every head into zero
- * string building, zero latin1 encoding and zero allocation; the request id is minted when the head
- * is built, which makes it unique per connection and reply shape rather than per repetition.
  */
-function writeReply(socket: Socket, reply: Reply, head: HeadSlot): void {
+function writeReply(socket: Socket, reply: Reply): void {
   const withhold = reply.status === 204 || reply.contentLength !== undefined;
   const body = withhold ? EMPTY : reply.body;
   const length = reply.contentLength ?? body.length;
-  let headBuffer: Buffer;
-  if (
-    head.status === reply.status &&
-    head.type === reply.contentType &&
-    head.length === length &&
-    head.cache === (reply.cacheControl === true) &&
-    head.extra === (reply.extraHeaders ?? null)
-  ) {
-    headBuffer = head.bytes as Buffer;
-  } else {
-    headBuffer = Buffer.from(headBlock(reply.status, reply.contentType, length, nextRequestId(), reply), 'latin1');
-    head.status = reply.status;
-    head.type = reply.contentType;
-    head.length = length;
-    head.cache = reply.cacheControl === true;
-    head.extra = reply.extraHeaders ?? null;
-    head.bytes = headBuffer;
-  }
+  const head = headBlock(reply.status, reply.contentType, length, nextRequestId(), reply);
   socket.cork();
-  socket.write(headBuffer);
+  socket.write(head, 'latin1');
   if (body.length > 0) socket.write(body);
   socket.uncork();
-}
-
-/** One connection's memo of the last head it wrote, and the five fields that key it. */
-interface HeadSlot {
-  status: number;
-  type: string | null;
-  length: number;
-  cache: boolean;
-  extra: Record<string, string> | null;
-  bytes: Buffer | null;
 }
 
 /** The JSON body every error reply carries. */
@@ -311,14 +279,11 @@ export function createHttpServer(dispatch: Dispatch): Server {
     });
     let buffer: Buffer = EMPTY;
     let closed = false;
-    /** This connection's memo of its last head block: see writeReply. */
-    const head: HeadSlot = { status: -1, type: null, length: -1, cache: false, extra: null, bytes: null };
-
     const fail = (status: number, message: string): void => {
       if (closed) return;
       closed = true;
       try {
-        writeReply(socket, errorReply(status, message), head);
+        writeReply(socket, errorReply(status, message));
       } catch {
         // The socket is already gone: nothing left to answer.
       }
@@ -384,7 +349,7 @@ export function createHttpServer(dispatch: Dispatch): Server {
         }
         if (info.holdBody) reply = { ...reply, contentLength: reply.body.length };
         const tWrite = stats.on ? process.hrtime.bigint() : 0n;
-        writeReply(socket, reply, head);
+        writeReply(socket, reply);
         if (stats.on) {
           const dispatchDelta = Number(tWrite - tDispatch);
           stats.parseNs += Number(tDispatch - tParse);
