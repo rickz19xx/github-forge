@@ -14,7 +14,7 @@ import {
   type GitObject,
   type TreeEntry,
 } from './gitcore.ts';
-import { STATE_EPOCH_ISO, STATE_EPOCH_SEC, type Forge, type Repo } from './gitstore.ts';
+import { STATE_EPOCH_ISO, STATE_EPOCH_SEC, type Forge, type Pull, type Repo } from './gitstore.ts';
 import { users } from './scenario.ts';
 
 export interface ApiReply {
@@ -196,7 +196,7 @@ function storeObject(repo: Repo, object: GitObject): string {
 }
 
 /** Write a blob at `segments`, creating the trees on the way up. Returns the new root tree id. */
-function writePath(repo: Repo, rootTree: string | null, segments: readonly string[], blobOid: string): string {
+export function writePath(repo: Repo, rootTree: string | null, segments: readonly string[], blobOid: string): string {
   const name = segments[0] as string;
   let entries: TreeEntry[] = [];
   if (rootTree !== null) {
@@ -237,7 +237,7 @@ function removePath(repo: Repo, rootTree: string, segments: readonly string[]): 
 }
 
 /** Build and store a commit; the returned id is its content hash. */
-function makeCommit(repo: Repo, treeOid: string, parents: readonly string[], message: string, login: string): string {
+export function makeCommit(repo: Repo, treeOid: string, parents: readonly string[], message: string, login: string): string {
   const view = userView(login);
   const identity = `${view.name} <${view.email}> ${STATE_EPOCH_SEC} +0000`;
   const body = message.endsWith('\n') ? message : `${message}\n`;
@@ -245,6 +245,11 @@ function makeCommit(repo: Repo, treeOid: string, parents: readonly string[], mes
   for (const parent of parents) lines.push(`parent ${parent}`);
   lines.push(`author ${identity}`, `committer ${identity}`, '', body);
   return storeObject(repo, { type: 'commit', data: Buffer.from(lines.join('\n'), 'utf8') });
+}
+
+/** The API url of one ref of a repository. */
+function gitRefUrl(call: ApiCall, repo: Repo, ref: string): string {
+  return `${call.origin}/api/v3/repos/${repo.owner}/${repo.name}/git/refs/${ref.replace(/^refs\//, '')}`;
 }
 
 /** Resolve a ref name, branch name, tag name or raw object id to a commit id (or the object it names). */
@@ -470,14 +475,39 @@ export function handleApi(call: ApiCall, forge: Forge): ApiReply {
   if (fourth === 'contents') return handleContents(call, repo, rest);
 
   if (fourth === 'git' && rest[0] === 'refs') {
-    if (call.method !== 'POST') return notFound();
-    const body = parseJsonBody(call);
-    const ref = asString(body.ref);
-    const sha = asString(body.sha);
-    if (ref === undefined || sha === undefined || !isOid(sha)) return unprocessable('Validation Failed');
-    if (repo.refs.has(ref)) return unprocessable('Reference already exists');
-    repo.refs.set(ref, sha);
-    return ok(201, { ref, node_id: `MDM6UmVm${ref}`, url: '', object: { sha, type: 'commit', url: '' } });
+    if (rest.length === 1) {
+      if (call.method === 'POST') {
+        const body = parseJsonBody(call);
+        const ref = asString(body.ref);
+        const sha = asString(body.sha);
+        if (ref === undefined || sha === undefined || !isOid(sha)) return unprocessable('Validation Failed');
+        if (repo.refs.has(ref)) return unprocessable('Reference already exists');
+        if (!repo.objects.has(sha)) return unprocessable('Object does not exist');
+        repo.refs.set(ref, sha);
+        return ok(201, { ref, node_id: `MDM6UmVm${ref}`, url: gitRefUrl(call, repo, ref), object: { sha, type: 'commit', url: '' } });
+      }
+      if (call.method === 'GET') {
+        const prefix = call.query.get('ref') ?? 'refs/';
+        const refs = [...repo.refs.keys()].filter((name) => name.startsWith(prefix)).sort();
+        return ok(200, refs.map((name) => ({ ref: name, node_id: `MDM6UmVm${name}`, url: gitRefUrl(call, repo, name), object: { sha: repo.refs.get(name), type: 'commit', url: '' } })));
+      }
+      return notFound();
+    }
+    // GET /git/refs/heads/{branch} and /git/refs/tags/{tag}: the ref's name is every remaining segment.
+    if (call.method === 'GET') {
+      const ref = rest.join('/');
+      const sha = repo.refs.get(ref);
+      if (sha === undefined) return notFound();
+      return ok(200, { ref, node_id: `MDM6UmVm${ref}`, url: gitRefUrl(call, repo, ref), object: { sha, type: 'commit', url: '' } });
+    }
+    return notFound();
+  }
+
+  if (fourth === 'branches' && rest.length === 1) {
+    const name = rest[0] as string;
+    const sha = repo.refs.get(`refs/heads/${name}`);
+    if (sha === undefined) return notFound();
+    return ok(200, { name, commit: { sha, url: `${call.origin}/api/v3/repos/${repo.owner}/${repo.name}/commits/${sha}` }, protected: false });
   }
 
   if (fourth === 'branches' && rest.length === 0) {
@@ -528,6 +558,31 @@ export function handleApi(call: ApiCall, forge: Forge): ApiReply {
     }
     if (call.method === 'GET' && rest.length === 0) {
       return ok(200, [...repo.labels].sort().map((name) => labelJson(repo, name)));
+    }
+    return notFound();
+  }
+
+  if (fourth === 'pulls') {
+    if (rest.length === 0) {
+      if (call.method === 'POST') return createPull(call, repo, forge);
+      if (call.method === 'GET') return listPulls(call, repo);
+      return notFound();
+    }
+    const number = Number.parseInt(rest[0] as string, 10);
+    if (!Number.isFinite(number)) return notFound();
+    const pull = repo.pulls.get(number);
+    if (pull === undefined) return notFound();
+    if (rest.length === 1) {
+      if (call.method !== 'GET') return notFound();
+      return ok(200, pullJson(call, repo, pull));
+    }
+    if (rest[1] === 'files' && rest.length === 2) {
+      if (call.method !== 'GET') return notFound();
+      return ok(200, pullFiles(repo, pull));
+    }
+    if (rest[1] === 'merge' && rest.length === 2) {
+      if (call.method !== 'PUT' && call.method !== 'POST') return notFound();
+      return mergePull(call, repo, pull);
     }
     return notFound();
   }
@@ -727,4 +782,230 @@ function listIssues(call: ApiCall, repo: Repo): ApiReply {
   const page = numberParam(call, 'page', 1);
   const slice = list.slice((page - 1) * perPage, page * perPage);
   return ok(200, slice.map((issue) => issueJson(repo, issue)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// pull requests
+// ---------------------------------------------------------------------------------------------
+
+/** Every blob under `treeOid`, keyed by its full path. */
+export function flattenTree(repo: Repo, treeOid: string, prefix = '', out = new Map<string, string>()): Map<string, string> {
+  const object = repo.objects.get(treeOid);
+  if (!object || object.type !== 'tree') return out;
+  for (const entry of parseTree(object.data)) {
+    const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.mode === '40000') flattenTree(repo, entry.oid, path, out);
+    else if (entry.mode !== '160000') out.set(path, entry.oid);
+  }
+  return out;
+}
+
+interface TreeDiff {
+  added: string[];
+  removed: string[];
+  modified: string[];
+}
+
+/** The blobs that differ between two trees, by path. */
+export function diffTrees(repo: Repo, fromTree: string | null, toTree: string | null): TreeDiff {
+  const before = fromTree === null ? new Map<string, string>() : flattenTree(repo, fromTree);
+  const after = toTree === null ? new Map<string, string>() : flattenTree(repo, toTree);
+  const added: string[] = [];
+  const modified: string[] = [];
+  const removed: string[] = [];
+  for (const [path, oid] of after) {
+    const was = before.get(path);
+    if (was === undefined) added.push(path);
+    else if (was !== oid) modified.push(path);
+  }
+  for (const path of before.keys()) if (!after.has(path)) removed.push(path);
+  added.sort();
+  modified.sort();
+  removed.sort();
+  return { added, removed, modified };
+}
+
+/** The tree a commit names, or null. */
+export function commitTree(repo: Repo, commitOid: string | null): string | null {
+  if (commitOid === null) return null;
+  const object = repo.objects.get(commitOid);
+  return object === undefined ? null : parseCommit(object.data).tree;
+}
+
+function lineCount(data: Buffer): number {
+  if (data.length === 0) return 0;
+  const lines = data.toString('utf8').split('\n').filter((line) => line.length > 0);
+  return Math.max(1, lines.length);
+}
+
+/** The per-file view of a pull request: what the head changed relative to the base it was opened on. */
+function pullFiles(repo: Repo, pull: Pull): unknown[] {
+  const baseTree = commitTree(repo, pull.baseSha);
+  const headTree = commitTree(repo, pull.headSha);
+  const diff = diffTrees(repo, baseTree, headTree);
+  const head = headTree === null ? new Map<string, string>() : flattenTree(repo, headTree);
+  const base = baseTree === null ? new Map<string, string>() : flattenTree(repo, baseTree);
+  const sizeOf = (oid: string | undefined): number => {
+    if (oid === undefined) return 0;
+    const object = repo.objects.get(oid);
+    return object === undefined ? 0 : lineCount(object.data);
+  };
+  const files: unknown[] = [];
+  for (const path of diff.added) {
+    const additions = sizeOf(head.get(path));
+    files.push({ filename: path, status: 'added', additions, deletions: 0, changes: additions, raw_url: '', blob_url: '', contents_url: '' });
+  }
+  for (const path of diff.modified) {
+    const additions = sizeOf(head.get(path));
+    const deletions = sizeOf(base.get(path));
+    files.push({ filename: path, status: 'modified', additions, deletions, changes: additions + deletions, raw_url: '', blob_url: '', contents_url: '' });
+  }
+  for (const path of diff.removed) {
+    const deletions = sizeOf(base.get(path));
+    files.push({ filename: path, status: 'removed', additions: 0, deletions, changes: deletions, raw_url: '', blob_url: '', contents_url: '' });
+  }
+  return files;
+}
+
+function pullJson(call: ApiCall, repo: Repo, pull: Pull): Record<string, unknown> {
+  const base = `${call.origin}/api/v3/repos/${repo.owner}/${repo.name}`;
+  const side = (ref: string, sha: string): Record<string, unknown> => ({
+    label: `${repo.owner}:${ref}`,
+    ref,
+    sha,
+    user: userJson(repo.owner),
+    repo: { id: repo.id, name: repo.name, full_name: `${repo.owner}/${repo.name}`, private: repo.isPrivate },
+  });
+  return {
+    id: pull.id,
+    node_id: `PR_${pull.id}`,
+    number: pull.number,
+    state: pull.state,
+    title: pull.title,
+    body: pull.body,
+    draft: false,
+    locked: false,
+    merged: pull.merged,
+    mergeable: true,
+    mergeable_state: 'clean',
+    merged_at: pull.mergedAt,
+    merge_commit_sha: pull.mergeCommitSha,
+    head: side(pull.headRef, pull.headSha),
+    base: side(pull.baseRef, pull.baseSha),
+    user: userJson(repo.owner),
+    assignee: null,
+    assignees: [],
+    milestone: null,
+    labels: [],
+    requested_reviewers: [],
+    comments: 0,
+    review_comments: 0,
+    commits: 1,
+    additions: 0,
+    deletions: 0,
+    changed_files: 0,
+    created_at: STATE_EPOCH_ISO,
+    updated_at: STATE_EPOCH_ISO,
+    closed_at: pull.state === 'closed' ? STATE_EPOCH_ISO : null,
+    url: `${base}/pulls/${pull.number}`,
+    html_url: `${call.origin}/${repo.owner}/${repo.name}/pull/${pull.number}`,
+    diff_url: `${call.origin}/${repo.owner}/${repo.name}/pull/${pull.number}.diff`,
+    patch_url: `${call.origin}/${repo.owner}/${repo.name}/pull/${pull.number}.patch`,
+    statuses_url: `${base}/statuses/${pull.headSha}`,
+  };
+}
+
+function createPull(call: ApiCall, repo: Repo, forge: Forge): ApiReply {
+  const body = parseJsonBody(call);
+  const headRef = asString(body.head);
+  const baseRef = asString(body.base) ?? repo.defaultBranch;
+  const title = asString(body.title);
+  if (headRef === undefined || title === undefined) {
+    return unprocessable('Validation Failed', [{ resource: 'PullRequest', code: 'missing_field', field: 'head' }]);
+  }
+  const headSha = repo.refs.get(`refs/heads/${headRef}`) ?? repo.refs.get(headRef);
+  const baseSha = repo.refs.get(`refs/heads/${baseRef}`) ?? repo.refs.get(baseRef);
+  if (headSha === undefined || baseSha === undefined) return unprocessable('Validation Failed', [{ resource: 'PullRequest', code: 'invalid', field: 'head' }]);
+  const existing = [...repo.pulls.values()].find((entry) => entry.state === 'open' && entry.headRef === headRef && entry.baseRef === baseRef);
+  if (existing !== undefined) {
+    return unprocessable('A pull request already exists for this head and base', [{ resource: 'PullRequest', code: 'custom', field: 'head' }]);
+  }
+  const number = repo.nextPullNumber;
+  repo.nextPullNumber += 1;
+  const pull: Pull = {
+    number,
+    id: forge.pullId(),
+    title,
+    body: asString(body.body) ?? '',
+    state: 'open',
+    headRef,
+    headSha,
+    baseRef,
+    baseSha,
+    merged: false,
+    mergeCommitSha: null,
+    mergedAt: null,
+  };
+  repo.pulls.set(number, pull);
+  return ok(201, pullJson(call, repo, pull));
+}
+
+function listPulls(call: ApiCall, repo: Repo): ApiReply {
+  const state = call.query.get('state') ?? 'open';
+  const perPage = Math.min(numberParam(call, 'per_page', 30), 100);
+  const page = numberParam(call, 'page', 1);
+  let list = [...repo.pulls.values()];
+  if (state !== 'all') list = list.filter((pull) => pull.state === state);
+  list.sort((a, b) => b.number - a.number);
+  return ok(200, list.slice((page - 1) * perPage, page * perPage).map((pull) => pullJson(call, repo, pull)));
+}
+
+/** Replay the head's changes onto the base tree; the paths that changed on both sides are conflicts. */
+function mergeTrees(repo: Repo, mergeBaseTree: string | null, headTree: string | null, baseTree: string | null): { tree: string; conflicts: string[] } {
+  const headDiff = diffTrees(repo, mergeBaseTree, headTree);
+  const baseDiff = diffTrees(repo, mergeBaseTree, baseTree);
+  const touchedByBase = new Set([...baseDiff.added, ...baseDiff.modified, ...baseDiff.removed]);
+  const conflicts = [...headDiff.added, ...headDiff.modified, ...headDiff.removed].filter((path) => touchedByBase.has(path)).sort();
+  let root: string | null = baseTree;
+  const head = headTree === null ? new Map<string, string>() : flattenTree(repo, headTree);
+  for (const path of [...headDiff.added, ...headDiff.modified].sort()) {
+    const oid = head.get(path);
+    if (oid !== undefined) root = writePath(repo, root, path.split('/'), oid);
+  }
+  for (const path of headDiff.removed) {
+    if (root === null) continue;
+    const pruned = removePath(repo, root, path.split('/'));
+    root = pruned === null || pruned === '' ? null : pruned;
+  }
+  if (root === null) root = storeObject(repo, { type: 'tree', data: Buffer.alloc(0) });
+  return { tree: root, conflicts };
+}
+
+/**
+ * Squash-merge one pull request: replay the head's changes onto the base branch's tip and move the
+ * branch. Answers the merge commit's id, or null when the pull request cannot be merged.
+ */
+export function mergePullInto(repo: Repo, pull: Pull, login: string): string | null {
+  if (pull.merged) return null;
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? repo.refs.get(pull.baseRef) ?? null;
+  if (baseTip === null) return null;
+  const mergeBaseTree = commitTree(repo, pull.baseSha);
+  const headTree = commitTree(repo, pull.headSha);
+  const baseTree = commitTree(repo, baseTip);
+  const { tree, conflicts } = mergeTrees(repo, mergeBaseTree, headTree, baseTree);
+  if (conflicts.length > 0) return null;
+  const message = `Merge pull request #${pull.number} from ${repo.owner}/${pull.headRef}\n\n${pull.title}`;
+  const mergeSha = makeCommit(repo, tree, [baseTip], message, login);
+  repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  pull.merged = true;
+  pull.state = 'closed';
+  pull.mergeCommitSha = mergeSha;
+  pull.mergedAt = STATE_EPOCH_ISO;
+  return mergeSha;
+}
+
+function mergePull(call: ApiCall, repo: Repo, pull: Pull): ApiReply {
+  const mergeSha = mergePullInto(repo, pull, call.login as string);
+  if (mergeSha === null) return ok(405, { message: 'Pull Request is not mergeable' });
+  return ok(200, { sha: mergeSha, merged: true, message: 'Pull Request successfully merged' });
 }

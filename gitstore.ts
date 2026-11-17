@@ -30,6 +30,22 @@ export interface Issue {
   comments: IssueComment[];
 }
 
+/** One pull request: the two refs it names, frozen shas, and its merge state. */
+export interface Pull {
+  number: number;
+  id: number;
+  title: string;
+  body: string;
+  state: 'open' | 'closed';
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  baseSha: string;
+  merged: boolean;
+  mergeCommitSha: string | null;
+  mergedAt: string | null;
+}
+
 /** One repository: its objects, its refs and the REST resources hanging off it. */
 export interface Repo {
   readonly id: number;
@@ -44,7 +60,10 @@ export interface Repo {
   nextIssueNumber: number;
   /** The 1-based comment id counter, shared by every issue in the repository. */
   nextCommentId: number;
+  /** The next pull request number (1-based, per repository). */
+  nextPullNumber: number;
   readonly issues: Map<number, Issue>;
+  readonly pulls: Map<number, Pull>;
   readonly labels: Set<string>;
 }
 
@@ -53,11 +72,19 @@ export class Forge {
   private readonly repos = new Map<string, Repo>();
   private nextRepoId = 1;
   private nextIssueId = 1;
+  private nextPullId = 1;
 
   /** The next globally unique issue id. */
   issueId(): number {
     const id = this.nextIssueId;
     this.nextIssueId += 1;
+    return id;
+  }
+
+  /** The next globally unique pull request id. */
+  pullId(): number {
+    const id = this.nextPullId;
+    this.nextPullId += 1;
     return id;
   }
 
@@ -68,6 +95,12 @@ export class Forge {
   /** The repository `owner/name`, or undefined. */
   get(owner: string, name: string): Repo | undefined {
     return this.repos.get(Forge.key(owner, name));
+  }
+
+  /** The repository with numeric id `id`, or undefined. */
+  findById(id: number): Repo | undefined {
+    for (const repo of this.repos.values()) if (repo.id === id) return repo;
+    return undefined;
   }
 
   /** Every repository `owner` owns, in creation order. */
@@ -93,7 +126,9 @@ export class Forge {
       refs: new Map(),
       nextIssueNumber: 1,
       nextCommentId: 1,
+      nextPullNumber: 1,
       issues: new Map(),
+      pulls: new Map(),
       labels: new Set(),
     };
     this.nextRepoId += 1;

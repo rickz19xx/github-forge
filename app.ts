@@ -9,6 +9,8 @@ import { createHash } from 'node:crypto';
 import { handleReceivePack, handleUploadPack, handleInfoRefs, WireError, type WireResponse } from './gitwire.ts';
 import { Forge, type Repo } from './gitstore.ts';
 import { BadRequest, handleApi, type ApiCall, type ApiReply } from './restapi.ts';
+import { executeDocument, parseGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 import { viewerLogin } from './scenario.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -120,6 +122,64 @@ export function createApp(): Server {
       // The env's boot check: 200 {"ok":true}.
       if (pathname === '/healthz' && method === 'GET') {
         sendJson(res, 200, { ok: true }, id);
+        return;
+      }
+
+      // GitHub's GraphQL v4 API: one document or an array of them in, {data, errors} out.
+      if (pathname === '/api/graphql') {
+        if (method !== 'POST') {
+          sendJson(res, 404, { message: 'Not Found' }, id);
+          return;
+        }
+        const token = tokenOf(req);
+        if (token === null) {
+          sendJson(res, 401, { message: 'Requires authentication' }, id);
+          return;
+        }
+        const login = loginForToken(token);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse((await readBody(req)).toString('utf8'));
+        } catch {
+          sendJson(res, 400, { message: 'Problems parsing JSON' }, id);
+          return;
+        }
+        const operations = Array.isArray(parsed) ? parsed : [parsed];
+        const answers = operations.map((operation) => {
+          const entry = operation as { query?: unknown; variables?: unknown; operationName?: unknown };
+          const document = typeof entry.query === 'string' ? entry.query : '';
+          const variables = (entry.variables !== null && typeof entry.variables === 'object' ? entry.variables : {}) as Record<string, unknown>;
+          try {
+            return executeDocument(parseGraphQL(document), forge, login, `http://${req.headers.host ?? '127.0.0.1'}`, variables);
+          } catch (err) {
+            return { data: null, errors: [{ message: err instanceof Error ? err.message : String(err) }] };
+          }
+        });
+        sendJson(res, 200, Array.isArray(parsed) ? answers : (answers[0] ?? { data: null }), id);
+        return;
+      }
+
+      // The Model Context Protocol endpoint: JSON-RPC over POST, one request per body.
+      if (pathname === '/mcp' || pathname === '/mcp/') {
+        if (method === 'DELETE') {
+          // No session to forget: the modern transport is stateless.
+          res.writeHead(204, { 'x-github-request-id': id });
+          res.end();
+          return;
+        }
+        if (method !== 'POST') {
+          sendJson(res, 405, { message: 'Method Not Allowed' }, id);
+          return;
+        }
+        const token = tokenOf(req);
+        const raw = (await readBody(req)).toString('utf8');
+        const answer = handleMcp(raw, forge, token === null ? null : loginForToken(token));
+        if (answer.body === null) {
+          res.writeHead(answer.status, { 'x-github-request-id': id });
+          res.end();
+          return;
+        }
+        sendJson(res, answer.status, answer.body, id);
         return;
       }
 
