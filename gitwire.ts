@@ -120,22 +120,20 @@ const RECEIVE_CAPS_V0 = [
   `symref=HEAD:refs/heads/${DEFAULT_BRANCH}`,
 ].join(' ');
 
-/** The v2 capability advertisement (upload-pack). */
-function advertisementV2(): Buffer {
-  const lines = [
-    `# service=${UPLOAD_SERVICE}\n`,
+/** The v2 capability advertisement (upload-pack): ref-independent, so it is built once. */
+const ADVERTISEMENT_V2: Buffer = ((): Buffer => {
+  const parts: Buffer[] = [
+    pktLine(`# service=${UPLOAD_SERVICE}\n`),
+    PKT_FLUSH,
+    pktLine('version 2\n'),
+    pktLine(`agent=${AGENT}\n`),
+    pktLine('ls-refs=unborn\n'),
+    pktLine('fetch=shallow wait-for-done\n'),
+    pktLine('object-format=sha1\n'),
+    PKT_FLUSH,
   ];
-  const parts: Buffer[] = [...pktLines(lines), PKT_FLUSH];
-  parts.push(...pktLines([
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow wait-for-done\n',
-    'object-format=sha1\n',
-  ]));
-  parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
-}
+})();
 
 /** The v0 ref advertisement, refs and peeled tags included, capability line on the first entry. */
 function advertisementV0(repo: Repo, service: string): Buffer {
@@ -170,16 +168,35 @@ function advertisementV0(repo: Repo, service: string): Buffer {
 }
 
 /** GET /:owner/:repo.git/info/refs. */
-export function handleInfoRefs(repo: Repo | undefined, service: string | null, gitProtocol: string | undefined): WireResponse {
+export function handleInfoRefs(repo: Repo | undefined, service: string | null, gitProtocol: string | null): WireResponse {
   if (repo === undefined) return json(404, 'Not Found');
   if (service !== UPLOAD_SERVICE && service !== RECEIVE_SERVICE) {
     return json(403, 'Smart HTTP is only available for git-upload-pack and git-receive-pack');
   }
-  if (service === UPLOAD_SERVICE && /version=2/.test(gitProtocol ?? '')) {
-    return { status: 200, contentType: smartType(service, 'advertisement'), body: advertisementV2() };
+  if (service === UPLOAD_SERVICE && gitProtocol !== null && gitProtocol.includes('version=2')) {
+    return { status: 200, contentType: smartType(service, 'advertisement'), body: ADVERTISEMENT_V2 };
   }
-  return { status: 200, contentType: smartType(service, 'advertisement'), body: advertisementV0(repo, service) };
+  // The v0 advertisement is a pure function of the refs, so an unchanged repository answers
+  // from the prebuilt bytes; a push moves the ref and the digest misses.
+  const key = `${repo.id}\u0000${service}\u0000${refDigest(repo)}`;
+  const cached = advertisementCache.get(key);
+  if (cached !== undefined) return { status: 200, contentType: smartType(service, 'advertisement'), body: cached };
+  const body = advertisementV0(repo, service);
+  remember(advertisementCache, key, body);
+  return { status: 200, contentType: smartType(service, 'advertisement'), body };
 }
+
+/** Insert into a prebuilt-body cache, dropping the oldest entry once it is full. */
+function remember(cache: Map<string, Buffer>, key: string, value: Buffer): void {
+  if (cache.size >= CACHE_ENTRIES) {
+    const oldest = cache.keys().next();
+    if (oldest.done !== true) cache.delete(oldest.value);
+  }
+  cache.set(key, value);
+}
+
+const CACHE_ENTRIES = 48;
+const advertisementCache = new Map<string, Buffer>();
 
 // ---------------------------------------------------------------------------------------------
 // parsing a command request
@@ -427,11 +444,14 @@ function handleFetch(repo: Repo, args: readonly string[]): Buffer {
 const ANSWER_CACHE_LIMIT = 64;
 const answerCache = new Map<string, Buffer>();
 
+/** Counters for the pack cache, read by the local harness; they never change an answer. */
+export const wireCounters = { fetchHit: 0, fetchBuild: 0, lsRefsHit: 0, fetchBytes: 0, fetchMs: 0 };
+
 /** A digest of the repository's refs: any ref move changes it. */
 function refDigest(repo: Repo): string {
-  const parts: string[] = [];
-  for (const name of [...repo.refs.keys()].sort()) parts.push(`${name}=${repo.refs.get(name) ?? ''}`);
-  return parts.join('\n');
+  let out = '';
+  for (const [name, oid] of repo.refs) out += `${name}=${oid}\n`;
+  return out;
 }
 
 /** POST /:owner/:repo.git/git-upload-pack. */
@@ -440,8 +460,15 @@ export function handleUploadPack(repo: Repo, body: Buffer): WireResponse {
   if (request.command === 'fetch') {
     const key = `${repo.id}\u0000${refDigest(repo)}\u0000${body.toString('latin1')}`;
     const cached = answerCache.get(key);
-    if (cached !== undefined) return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: cached };
+    if (cached !== undefined) {
+      wireCounters.fetchHit += 1;
+      return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: cached };
+    }
+    const buildStart = performance.now();
     const answer = handleFetch(repo, request.args);
+    wireCounters.fetchBuild += 1;
+    wireCounters.fetchBytes += answer.length;
+    wireCounters.fetchMs += performance.now() - buildStart;
     // One entry is one packfile: keep a single one from eating the pod's memory.
     if (answer.length > 1_048_576) return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: answer };
     if (answerCache.size >= ANSWER_CACHE_LIMIT) {
@@ -452,10 +479,18 @@ export function handleUploadPack(repo: Repo, body: Buffer): WireResponse {
     return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: answer };
   }
   if (request.command === 'ls-refs') {
-    return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: handleLsRefs(repo, request.args) };
+    // ls-refs is refs plus the client's arguments: cache the prebuilt bytes the same way.
+    const key = `${repo.id}\u0000${refDigest(repo)}\u0000${request.args.join('\u0000')}`;
+    const cached = lsRefsCache.get(key);
+    if (cached !== undefined) return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: cached };
+    const answer = handleLsRefs(repo, request.args);
+    remember(lsRefsCache, key, answer);
+    return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: answer };
   }
   throw new WireError(`unknown upload-pack command ${JSON.stringify(request.command ?? '')}`);
 }
+
+const lsRefsCache = new Map<string, Buffer>();
 
 // ---------------------------------------------------------------------------------------------
 // receive-pack
@@ -559,7 +594,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): WireResponse {
   const packBytes = body.subarray(packStart);
   if (packBytes.length > 0) {
     const read = readPack(packBytes, Forge.lookup(repo));
-    Forge.store(repo, read.objects.values());
+    Forge.storePacked(repo, read.objects);
   }
 
   const results = commands.map((command) => applyCommand(repo, command));

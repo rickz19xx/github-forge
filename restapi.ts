@@ -14,13 +14,15 @@ import {
   type GitObject,
   type TreeEntry,
 } from './gitcore.ts';
-import { STATE_EPOCH_ISO, STATE_EPOCH_SEC, type Forge, type Pull, type Repo } from './gitstore.ts';
+import { STATE_EPOCH_ISO, STATE_EPOCH_SEC, type Forge, type Issue, type Pull, type Repo } from './gitstore.ts';
 import { users } from './scenario.ts';
 
 export interface ApiReply {
   status: number;
   json: unknown;
   headers?: Record<string, string>;
+  /** The exact reply bytes, when a handler already holds them (JSON, newline included). */
+  bytes?: Buffer;
 }
 
 /** A read-only view of a request's query string: `get` answers a parameter's value, or undefined. */
@@ -388,6 +390,25 @@ function issueJson(repo: Repo, issue: { number: number; id: number; title: strin
 // routing
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * A revision of the whole store, bumped by every request that is not a GET. A cached read body is
+ * only reused while the revision it was built at is still current, so no answer can go stale.
+ */
+let storeRevision = 0;
+
+/** Issue bodies, keyed by issue id: a read of an unchanged issue is one Map hit and one write. */
+const issueBodies = new Map<number, { revision: number; bytes: Buffer }>();
+
+/** The exact reply bytes for one issue, cached until anything in the store changes. */
+function issueBytes(repo: Repo, issue: Issue): Buffer {
+  const cached = issueBodies.get(issue.id);
+  if (cached !== undefined && cached.revision === storeRevision) return cached.bytes;
+  const bytes = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  if (issueBodies.size >= 8192) issueBodies.clear();
+  issueBodies.set(issue.id, { revision: storeRevision, bytes });
+  return bytes;
+}
+
 function parseJsonBody(call: ApiCall): Record<string, unknown> {
   if (call.body.length === 0) return {};
   const text = call.body.toString('utf8');
@@ -427,6 +448,11 @@ function isRepo(value: ApiReply | Repo): value is Repo {
 /** The `/api/v3` entry point. */
 export function handleApi(call: ApiCall, forge: Forge): ApiReply {
   const [head, second, third, fourth, ...rest] = call.segments;
+  // Anything that is not a read may change what a cached read body would say.
+  if (call.method !== 'GET') {
+    storeRevision += 1;
+    issueBodies.clear();
+  }
 
   // The API root and meta need no token.
   if (call.segments.length === 0 || (call.segments.length === 1 && call.segments[0] === '')) {
@@ -603,7 +629,7 @@ export function handleApi(call: ApiCall, forge: Forge): ApiReply {
     const issue = repo.issues.get(number);
     if (issue === undefined) return notFound();
     if (rest.length === 1) {
-      if (call.method === 'GET') return ok(200, issueJson(repo, issue));
+      if (call.method === 'GET') return { status: 200, json: null, bytes: issueBytes(repo, issue) };
       if (call.method === 'PATCH') {
         const body = parseJsonBody(call);
         const state = asString(body.state);
@@ -612,6 +638,8 @@ export function handleApi(call: ApiCall, forge: Forge): ApiReply {
         if (title !== undefined) issue.title = title;
         const bodyText = asString(body.body);
         if (bodyText !== undefined) issue.body = bodyText;
+        storeRevision += 1;
+        issueBodies.clear();
         return ok(200, issueJson(repo, issue));
       }
       return notFound();

@@ -23,14 +23,23 @@ export const PKT_LINE_PAYLOAD_MAX = PKT_LINE_MAX - 4;
 // pkt-line
 // ---------------------------------------------------------------------------------------------
 
-/** Encode one data packet: 4 hex length bytes (payload + 4) then the payload. */
+/** Encode one data packet: 4 hex length bytes (payload + 4) then the payload, in one allocation. */
 export function pktLine(payload: string | Uint8Array): Buffer {
-  const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : Buffer.from(payload);
-  if (data.length > PKT_LINE_PAYLOAD_MAX) throw new Error(`pkt-line payload is ${data.length} bytes, over the maximum`);
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  const size = typeof payload === 'string' ? Buffer.byteLength(payload, 'utf8') : payload.length;
+  if (size > PKT_LINE_PAYLOAD_MAX) throw new Error(`pkt-line payload is ${size} bytes, over the maximum`);
+  const total = size + 4;
+  const out = Buffer.allocUnsafe(total);
+  out[0] = HEX_DIGIT[total >> 12] as number;
+  out[1] = HEX_DIGIT[(total >> 8) & 15] as number;
+  out[2] = HEX_DIGIT[(total >> 4) & 15] as number;
+  out[3] = HEX_DIGIT[total & 15] as number;
+  if (typeof payload === 'string') out.write(payload, 4, size, 'utf8');
+  else if (size > 0) out.set(payload, 4);
+  return out;
 }
+
+/** The 16 lowercase hex digit codes, for writing a pkt-line length without building a string. */
+const HEX_DIGIT = Buffer.from('0123456789abcdef', 'latin1');
 
 /** The three control packets. */
 export const PKT_FLUSH = Buffer.from('0000', 'ascii');
@@ -365,9 +374,32 @@ export function readPack(pack: Uint8Array, resolveBase?: ObjectLookup): PackRead
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const declared = buf.readUInt32BE(8);
   const trailerStart = buf.length - 20;
-  const trailer = buf.toString('hex', trailerStart);
-  const computed = createHash('sha1').update(buf.subarray(0, trailerStart)).digest('hex');
-  if (trailer !== computed) throw new Error('pack trailer does not match its bytes');
+  const digest = createHash('sha1').update(buf.subarray(0, trailerStart)).digest();
+  if (!digest.equals(buf.subarray(trailerStart))) throw new Error('pack trailer does not match its bytes');
+
+  // The common push carries plain objects only: inflate each one, hash it, and skip the delta
+  // machinery entirely (no offset maps, no resolver closure, no second pass).
+  const objects = new Map<string, GitObject>();
+  let offset = 12;
+  let plain = true;
+  for (let index = 0; index < declared; index += 1) {
+    const header = readVarintHeader(buf, offset);
+    offset = header.next;
+    if (header.typeCode === 6 || header.typeCode === 7) {
+      plain = false;
+      break;
+    }
+    const type = CODE_TYPE[header.typeCode];
+    if (type === undefined) throw new Error(`pack entry ${index} has unknown type code ${header.typeCode}`);
+    const inflated = inflateAt(buf, offset);
+    offset = inflated.next;
+    const oid = hashObject(type, inflated.data);
+    if (!objects.has(oid)) objects.set(oid, { type, data: inflated.data });
+  }
+  if (plain) {
+    if (offset !== trailerStart) throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
+    return { objects, count: declared, deltaCount: 0 };
+  }
 
   interface RawEntry {
     offset: number;
@@ -384,7 +416,7 @@ export function readPack(pack: Uint8Array, resolveBase?: ObjectLookup): PackRead
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
   const byOid = new Map<string, RawEntry>();
-  let offset = 12;
+  offset = 12;
   for (let index = 0; index < declared; index += 1) {
     const entryOffset = offset;
     const header = readVarintHeader(buf, offset);
@@ -449,11 +481,9 @@ export function readPack(pack: Uint8Array, resolveBase?: ObjectLookup): PackRead
     return { type, data, oid };
   };
 
-  const objects = new Map<string, GitObject>();
-  let deltaCount = 0;
+  const deltaCount = raw.length;
   for (const entry of raw) {
     const resolved = resolve(entry);
-    if (entry.typeCode === 6 || entry.typeCode === 7) deltaCount += 1;
     if (!objects.has(resolved.oid)) objects.set(resolved.oid, { type: resolved.type, data: resolved.data });
   }
   return { objects, count: declared, deltaCount };

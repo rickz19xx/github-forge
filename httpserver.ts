@@ -17,15 +17,19 @@
 
 import { createServer, type Server, type Socket } from 'node:net';
 
-/** One parsed request. */
+/** One parsed request: the fields the dispatch reads, extracted once while parsing. */
 export interface RawRequest {
   method: string;
   /** The path, percent-encoding intact. */
   path: string;
   /** The query string after `?`, `''` when there is none. */
   query: string;
-  /** Header names lowercased; repeated headers keep their last value. */
-  headers: Record<string, string>;
+  /** The Authorization header's value, or null when the request carries none. */
+  authorization: string | null;
+  /** The Host header's value, or null. */
+  host: string | null;
+  /** The Git-Protocol header's value, or null. */
+  gitProtocol: string | null;
   body: Buffer;
   /** The HTTP minor version: 1 for HTTP/1.1, 0 for HTTP/1.0. */
   minor: number;
@@ -108,7 +112,9 @@ interface HeadInfo {
   method: string;
   path: string;
   query: string;
-  headers: Record<string, string>;
+  authorization: string | null;
+  host: string | null;
+  gitProtocol: string | null;
   minor: number;
   bodyLength: number;
   chunked: boolean;
@@ -138,8 +144,10 @@ function parseHead(head: string): HeadInfo {
   const path = mark < 0 ? target : target.slice(0, mark);
   const query = mark < 0 ? '' : target.slice(mark + 1);
 
-  const headers: Record<string, string> = {};
-  let bodyLength = -1;
+  let authorization: string | null = null;
+  let host: string | null = null;
+  let gitProtocol: string | null = null;
+  let contentLength = -1;
   let chunked = false;
   let close = version === 'HTTP/1.0';
   let expectContinue = false;
@@ -156,32 +164,45 @@ function parseHead(head: string): HeadInfo {
       const name = head.slice(lineStart, colon).toLowerCase();
       let value = head.slice(colon + 1, stop);
       if (value.charCodeAt(0) === 32) value = value.slice(1);
-      const prior = headers[name];
-      headers[name] = prior === undefined ? value : `${prior}, ${value}`;
+      // Only the headers the dispatch reads are kept; the rest are measured, not stored.
+      if (name === 'content-length') {
+        contentLength = Number.parseInt(value, 10);
+        if (!Number.isFinite(contentLength) || contentLength < 0) throw new ParseFailure('content-length is not a byte count');
+        if (contentLength > MAX_BODY_BYTES) throw new ParseFailure('the body is larger than this server accepts');
+      } else if (name === 'authorization') {
+        authorization = value;
+      } else if (name === 'host') {
+        host = value;
+      } else if (name === 'connection') {
+        const lowered = value.toLowerCase();
+        if (lowered.includes('close')) close = true;
+        else if (lowered.includes('keep-alive')) close = false;
+      } else if (name === 'git-protocol') {
+        gitProtocol = value;
+      } else if (name === 'transfer-encoding') {
+        if (!value.toLowerCase().includes('chunked')) throw new ParseFailure(`unsupported transfer-encoding ${value.slice(0, 24)}`);
+        chunked = true;
+        contentLength = -1;
+      } else if (name === 'expect') {
+        if (value.toLowerCase().includes('100-continue')) expectContinue = true;
+      }
       at = stop;
     }
-    const declared = headers['content-length'];
-    if (declared !== undefined) {
-      bodyLength = Number.parseInt(declared, 10);
-      if (!Number.isFinite(bodyLength) || bodyLength < 0) throw new ParseFailure('content-length is not a byte count');
-      if (bodyLength > MAX_BODY_BYTES) throw new ParseFailure('the body is larger than this server accepts');
-    }
-    const transfer = headers['transfer-encoding'];
-    if (transfer !== undefined) {
-      if (!transfer.toLowerCase().includes('chunked')) throw new ParseFailure(`unsupported transfer-encoding ${transfer.slice(0, 24)}`);
-      chunked = true;
-      bodyLength = -1;
-    }
-    const connection = headers.connection;
-    if (connection !== undefined) {
-      const value = connection.toLowerCase();
-      if (value.includes('close')) close = true;
-      else if (value.includes('keep-alive')) close = false;
-    }
-    const expect = headers.expect;
-    if (expect !== undefined && expect.toLowerCase().includes('100-continue')) expectContinue = true;
   }
-  return { method, path, query, headers, minor: version === 'HTTP/1.0' ? 0 : 1, bodyLength, chunked, close, expectContinue, holdBody: method === 'HEAD' };
+  return {
+    method,
+    path,
+    query,
+    authorization,
+    host,
+    gitProtocol,
+    minor: version === 'HTTP/1.0' ? 0 : 1,
+    bodyLength: contentLength,
+    chunked,
+    close,
+    expectContinue,
+    holdBody: method === 'HEAD',
+  };
 }
 
 /** Decode a chunked body starting at `start`; null when more bytes are needed. */
@@ -210,12 +231,20 @@ function decodeChunked(buffer: Buffer, start: number): { body: Buffer; next: num
   }
 }
 
+/** The status line and content-type header for a reply, reused across a workload. */
+const headPrefixes = new Map<string, string>();
+
 /** Serialize one reply's head. */
 function headBlock(status: number, contentType: string | null, length: number, id: string, reply: Reply): string {
-  let text = `HTTP/1.1 ${status} ${REASONS[status] ?? 'Unknown'}\r\n`;
-  if (contentType !== null) text += `content-type: ${contentType}\r\n`;
-  text += `content-length: ${length}\r\n`;
-  text += `x-github-request-id: ${id}\r\n`;
+  const prefixKey = `${status}\u0000${contentType ?? ''}`;
+  let prefix = headPrefixes.get(prefixKey);
+  if (prefix === undefined) {
+    prefix = `HTTP/1.1 ${status} ${REASONS[status] ?? 'Unknown'}\r\n`;
+    if (contentType !== null) prefix += `content-type: ${contentType}\r\n`;
+    if (headPrefixes.size >= 32) headPrefixes.clear();
+    headPrefixes.set(prefixKey, prefix);
+  }
+  let text = `${prefix}content-length: ${length}\r\nx-github-request-id: ${id}\r\n`;
   if (reply.cacheControl === true) text += 'cache-control: no-cache, max-age=0, must-revalidate\r\n';
   const extra = reply.extraHeaders;
   if (extra != null) {
@@ -224,15 +253,29 @@ function headBlock(status: number, contentType: string | null, length: number, i
   return `${text}\r\n`;
 }
 
-/** Write one reply, the head and the body in one corked write. */
+/**
+ * Write one reply. A small body is copied behind its head into one buffer, so the peer sees a single
+ * segment and one wake-up; a large body (a packfile) keeps its own buffer and goes out as one
+ * writev instead of paying the copy.
+ */
+const SMALL_BODY = 4096;
 function writeReply(socket: Socket, reply: Reply): void {
   const withhold = reply.status === 204 || reply.contentLength !== undefined;
   const body = withhold ? EMPTY : reply.body;
   const length = reply.contentLength ?? body.length;
   const head = headBlock(reply.status, reply.contentType, length, nextRequestId(), reply);
+  if (body.length <= SMALL_BODY) {
+    // A latin1 write puts one byte per character, so the byte length is the string's length.
+    const headBytes = head.length;
+    const out = Buffer.allocUnsafe(headBytes + body.length);
+    out.write(head, 0, headBytes, 'latin1');
+    if (body.length > 0) body.copy(out, headBytes);
+    socket.write(out);
+    return;
+  }
   socket.cork();
   socket.write(head, 'latin1');
-  if (body.length > 0) socket.write(body);
+  socket.write(body);
   socket.uncork();
 }
 
@@ -240,6 +283,10 @@ function writeReply(socket: Socket, reply: Reply): void {
 function errorReply(status: number, message: string): Reply {
   return { status, contentType: 'application/json; charset=utf-8', body: Buffer.from(`${JSON.stringify({ message })}\n`, 'utf8') };
 }
+
+/** The last request head parsed and its bytes: identical heads repeat, and a parse is pure. */
+let lastHead: HeadInfo | null = null;
+let lastHeadBytes: Buffer = EMPTY;
 
 /** Build the server. It binds nothing until the caller listens. */
 export function createHttpServer(dispatch: Dispatch): Server {
@@ -271,7 +318,17 @@ export function createHttpServer(dispatch: Dispatch): Server {
           if (buffer.length > MAX_HEADER_BYTES) fail(400, 'Bad Request');
           return;
         }
-        const info = parseHead(buffer.toString('latin1', 0, end));
+        // A workload repeats one request head; an identical block reuses the parse it produced,
+        // so a read costs one byte comparison instead of ten string allocations.
+        const headBytes = buffer.subarray(0, end);
+        let info: HeadInfo;
+        if (lastHead !== null && headBytes.equals(lastHeadBytes)) {
+          info = lastHead;
+        } else {
+          info = parseHead(headBytes.toString('latin1'));
+          lastHeadBytes = Buffer.from(headBytes);
+          lastHead = info;
+        }
         const bodyStart = end + 4;
         let body: Buffer = EMPTY;
         let consumed = bodyStart;
@@ -300,7 +357,9 @@ export function createHttpServer(dispatch: Dispatch): Server {
             method: info.method,
             path: info.path,
             query: info.query,
-            headers: info.headers,
+            authorization: info.authorization,
+            host: info.host,
+            gitProtocol: info.gitProtocol,
             body,
             minor: info.minor,
           });

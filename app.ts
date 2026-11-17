@@ -34,14 +34,25 @@ function loginForToken(token: string): string {
   return `ghost-${createHash('sha1').update(`ghforge-token/${token}`).digest('hex').slice(0, 12)}`;
 }
 
-/** The bearer token a request carries, or null when it carries no Authorization header at all. */
-function tokenOf(headers: Record<string, string>): string | null {
-  const raw = headers.authorization;
-  if (typeof raw !== 'string') return null;
+/** The last Authorization value seen and the login it maps to: a workload repeats one token. */
+let lastAuthorization: string | null = null;
+let lastAuthorizationLogin: string | null = null;
+
+/** The login a request's Authorization header names, or null when it carries none. */
+function loginOf(raw: string | null): string | null {
+  if (raw === null) return null;
+  if (raw === lastAuthorization) return lastAuthorizationLogin;
   const match = /^\s*(token|bearer)\s+(.*)$/i.exec(raw);
-  if (match !== null) return match[2] ?? '';
-  const bare = raw.trim();
-  return bare === '' ? null : bare;
+  let login: string | null;
+  if (match !== null) {
+    login = loginForToken(match[2] ?? '');
+  } else {
+    const bare = raw.trim();
+    login = bare === '' ? null : loginForToken(bare);
+  }
+  lastAuthorization = raw;
+  lastAuthorizationLogin = login;
+  return login;
 }
 
 /** One query component, decoded the way URLSearchParams reads it. */
@@ -94,14 +105,22 @@ function sendWire(reply: WireResponse): Reply {
 
 function sendApi(reply: ApiReply): Reply {
   if (reply.status === 204) return { status: 204, contentType: null, body: Buffer.alloc(0) };
+  // A handler that already holds the exact bytes (a repeated read) skips serialize-into-string.
+  if (reply.bytes !== undefined) return { status: reply.status, contentType: JSON_TYPE, body: reply.bytes, extraHeaders: reply.headers ?? null };
   return jsonReply(reply.status, reply.json, reply.headers ?? null);
 }
 
 /** A repository path split into its parts, or null when the path is not a `.git` route. */
+const gitPaths = new Map<string, { owner: string; name: string; rest: string } | null>();
+
 function parseGitPath(pathname: string): { owner: string; name: string; rest: string } | null {
+  const cached = gitPaths.get(pathname);
+  if (cached !== undefined) return cached;
   const match = /^\/([^/]+)\/([^/]+?)\.git(\/.*)?$/.exec(pathname);
-  if (match === null) return null;
-  return { owner: match[1] as string, name: match[2] as string, rest: match[3] ?? '' };
+  const route = match === null ? null : { owner: match[1] as string, name: match[2] as string, rest: match[3] ?? '' };
+  if (gitPaths.size >= 2048) gitPaths.clear();
+  gitPaths.set(pathname, route);
+  return route;
 }
 
 /** The decoded path segments of a REST path (`/api/v3` already removed), empty segments dropped. */
@@ -127,6 +146,30 @@ function segmentsOf(rest: string): string[] {
   return out;
 }
 
+/** The decoded REST path segments for a path, memoized: a workload repeats one path 2,000 times. */
+const segmentsByPath = new Map<string, string[]>();
+
+function segmentsFor(pathname: string): string[] {
+  const cached = segmentsByPath.get(pathname);
+  if (cached !== undefined) return cached;
+  const built = segmentsOf(pathname.slice(API_PREFIX.length));
+  if (segmentsByPath.size >= 2048) segmentsByPath.clear();
+  segmentsByPath.set(pathname, built);
+  return built;
+}
+
+/** The query bag for a query string, memoized the same way; `RawQuery` holds no state. */
+let lastQueryRaw: string | null = null;
+let lastQueryBag: RawQuery | null = null;
+
+function queryFor(raw: string): RawQuery {
+  if (raw === lastQueryRaw) return lastQueryBag as RawQuery;
+  const bag = new RawQuery(raw);
+  lastQueryRaw = raw;
+  lastQueryBag = bag;
+  return bag;
+}
+
 /** Build the dispatcher over a fresh Forge: one function from a parsed request to the reply. */
 export function createDispatch(): Dispatch {
   const forge = new Forge();
@@ -142,16 +185,15 @@ export function createDispatch(): Dispatch {
       // GitHub's GraphQL v4 API: one document or an array of them in, {data, errors} out.
       if (pathname === '/api/graphql') {
         if (method !== 'POST') return jsonReply(404, { message: 'Not Found' });
-        const token = tokenOf(req.headers);
-        if (token === null) return jsonReply(401, { message: 'Requires authentication' });
-        const login = loginForToken(token);
+        const login = loginOf(req.authorization);
+        if (login === null) return jsonReply(401, { message: 'Requires authentication' });
         let parsed: unknown;
         try {
           parsed = JSON.parse(req.body.toString('utf8'));
         } catch {
           return jsonReply(400, { message: 'Problems parsing JSON' });
         }
-        const origin = `http://${req.headers.host ?? '127.0.0.1'}`;
+        const origin = `http://${req.host ?? '127.0.0.1'}`;
         const operations = Array.isArray(parsed) ? parsed : [parsed];
         const answers = operations.map((operation) => {
           const entry = operation as { query?: unknown; variables?: unknown; operationName?: unknown };
@@ -173,22 +215,22 @@ export function createDispatch(): Dispatch {
           return { status: 204, contentType: null, body: Buffer.alloc(0) };
         }
         if (method !== 'POST') return jsonReply(405, { message: 'Method Not Allowed' });
-        const token = tokenOf(req.headers);
-        const answer = handleMcp(req.body.toString('utf8'), forge, token === null ? null : loginForToken(token));
+        const login = loginOf(req.authorization);
+        const answer = handleMcp(req.body.toString('utf8'), forge, login);
         if (answer.body === null) return { status: answer.status, contentType: null, body: Buffer.alloc(0) };
         return jsonReply(answer.status, answer.body);
       }
 
       // The GitHub API surface.
       if (pathname === API_PREFIX || pathname.startsWith(`${API_PREFIX}/`)) {
-        const token = tokenOf(req.headers);
+        const token = loginOf(req.authorization);
         const call: ApiCall = {
           method,
-          segments: segmentsOf(pathname.slice(API_PREFIX.length)),
-          query: new RawQuery(req.query),
+          segments: segmentsFor(pathname),
+          query: queryFor(req.query),
           body: req.body,
-          login: token === null ? null : loginForToken(token),
-          origin: `http://${req.headers.host ?? '127.0.0.1'}`,
+          login: token,
+          origin: `http://${req.host ?? '127.0.0.1'}`,
         };
         return sendApi(handleApi(call, forge));
       }
@@ -198,8 +240,8 @@ export function createDispatch(): Dispatch {
       if (route !== null) {
         const repo: Repo | undefined = forge.get(route.owner, route.name);
         if (route.rest === '/info/refs' && method === 'GET') {
-          const protocol = req.headers['git-protocol'];
-          return sendWire(handleInfoRefs(repo, new RawQuery(req.query).get('service') ?? null, protocol));
+          const protocol = req.gitProtocol;
+          return sendWire(handleInfoRefs(repo, queryFor(req.query).get('service') ?? null, protocol));
         }
         if ((route.rest === '/git-upload-pack' || route.rest === '/git-receive-pack') && method === 'POST') {
           if (repo === undefined) return jsonReply(404, { message: 'Not Found' });

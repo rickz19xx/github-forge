@@ -154,6 +154,11 @@ export class Forge {
     }
   }
 
+  /** Store objects the pack reader already hashed: no second SHA-1 per object. */
+  static storePacked(repo: Repo, objects: ReadonlyMap<string, GitObject>): void {
+    for (const [oid, object] of objects) if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+  }
+
   /** The type of `oid`, or undefined. */
   static typeOf(repo: Repo, oid: string): ObjectType | undefined {
     return repo.objects.get(oid)?.type;
