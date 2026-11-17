@@ -476,6 +476,8 @@ func reasonFor(status int) string {
 		return "OK"
 	case 201:
 		return "Created"
+	case 202:
+		return "Accepted"
 	case 204:
 		return "No Content"
 	case 301:

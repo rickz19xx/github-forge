@@ -1689,7 +1689,7 @@ func (s *Server) handlePulls(c *apiCall, repo *Repo, rest [][]byte) (response, *
 		if c.method != methodPut && c.method != methodPost {
 			return notFoundReply(), nil
 		}
-		mergeSha, ok := s.mergePullInto(repo, pull, c.login)
+		mergeSha, ok := mergePullRequest(repo, pull, c.login)
 		if !ok {
 			return messageJSON(405, "Pull Request is not mergeable"), nil
 		}
@@ -1865,7 +1865,7 @@ func splitPath(path string) [][]byte {
 
 // mergePullInto squash-merges one pull request: replay the head's changes onto the base branch's
 // tip and move the branch. ok is false when the pull request cannot be merged.
-func (s *Server) mergePullInto(repo *Repo, pull *Pull, login string) (oid, bool) {
+func mergePullRequest(repo *Repo, pull *Pull, login string) (oid, bool) {
 	if pull.merged {
 		return oid{}, false
 	}
