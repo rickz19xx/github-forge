@@ -18,6 +18,7 @@ import { viewerLogin } from './scenario.ts';
 import { createHttpServer, type Dispatch, type Reply, type RawRequest } from './httpserver.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
+
 /** The path every REST route hangs under. */
 const API_PREFIX = '/api/v3';
 /** The env's bearer token, as the grader hands it to the entry. */

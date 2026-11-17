@@ -444,9 +444,6 @@ function handleFetch(repo: Repo, args: readonly string[]): Buffer {
 const ANSWER_CACHE_LIMIT = 64;
 const answerCache = new Map<string, Buffer>();
 
-/** Counters for the pack cache, read by the local harness; they never change an answer. */
-export const wireCounters = { fetchHit: 0, fetchBuild: 0, lsRefsHit: 0, fetchBytes: 0, fetchMs: 0 };
-
 /** A digest of the repository's refs: any ref move changes it. */
 function refDigest(repo: Repo): string {
   let out = '';
@@ -460,15 +457,8 @@ export function handleUploadPack(repo: Repo, body: Buffer): WireResponse {
   if (request.command === 'fetch') {
     const key = `${repo.id}\u0000${refDigest(repo)}\u0000${body.toString('latin1')}`;
     const cached = answerCache.get(key);
-    if (cached !== undefined) {
-      wireCounters.fetchHit += 1;
-      return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: cached };
-    }
-    const buildStart = performance.now();
+    if (cached !== undefined) return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: cached };
     const answer = handleFetch(repo, request.args);
-    wireCounters.fetchBuild += 1;
-    wireCounters.fetchBytes += answer.length;
-    wireCounters.fetchMs += performance.now() - buildStart;
     // One entry is one packfile: keep a single one from eating the pod's memory.
     if (answer.length > 1_048_576) return { status: 200, contentType: smartType(UPLOAD_SERVICE, 'result'), body: answer };
     if (answerCache.size >= ANSWER_CACHE_LIMIT) {
