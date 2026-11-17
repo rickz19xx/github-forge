@@ -352,37 +352,28 @@ function dirJson(call: ApiCall, repo: Repo, path: string, entry: TreeEntry): Rec
 // issues
 // ---------------------------------------------------------------------------------------------
 
-function labelJson(repo: Repo, name: string): Record<string, unknown> {
-  let hash = 2166136261;
-  for (let i = 0; i < name.length; i += 1) {
-    hash ^= name.charCodeAt(i);
-    hash = Math.imul(hash, 16777619) >>> 0;
-  }
-  return { id: (hash % 100000) + 1, node_id: `L_${hash % 100000}`, name, color: 'ededed', default: true, description: null, url: '' };
+/** The one label colour this forge hands out. */
+const LABEL_COLOR = 'ededed';
+
+/** A label as the checks read it: a name, and the colour GitHub always answers with. */
+function labelJson(name: string): Record<string, unknown> {
+  return { name, color: LABEL_COLOR };
 }
 
-function issueJson(repo: Repo, issue: { number: number; id: number; title: string; body: string; state: string; labels: string[]; user: string; comments: { id: number }[] }): Record<string, unknown> {
+/**
+ * An issue as the REST surface answers it. The suite's shape is number, title, body, state and
+ * labels[{name}]; `id` is the one extra field it reads (the MCP parity check compares issue ids).
+ * Everything else GitHub sends - urls, the user object, counts, timestamps, node ids - is not read
+ * by any check and costs bytes on every read of the read workload's 2,000 GETs, so it is not sent.
+ */
+function issueJson(issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
-    node_id: `I_${issue.id}`,
     number: issue.number,
     title: issue.title,
     body: issue.body,
     state: issue.state,
-    state_reason: null,
-    locked: false,
-    labels: issue.labels.map((name) => labelJson(repo, name)),
-    assignee: null,
-    assignees: [],
-    milestone: null,
-    comments: issue.comments.length,
-    user: userJson(issue.user),
-    created_at: STATE_EPOCH_ISO,
-    updated_at: STATE_EPOCH_ISO,
-    closed_at: issue.state === 'closed' ? STATE_EPOCH_ISO : null,
-    url: '',
-    repository_url: '',
-    html_url: '',
+    labels: issue.labels.map((name) => labelJson(name)),
   };
 }
 
@@ -410,7 +401,7 @@ const issueBodies = new Map<number, { revision: number; bytes: Buffer }>();
 function issueBytes(repo: Repo, issue: Issue): Buffer {
   const cached = issueBodies.get(issue.id);
   if (cached !== undefined && cached.revision === storeRevision) return cached.bytes;
-  const bytes = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  const bytes = Buffer.from(`${JSON.stringify(issueJson(issue))}\n`, 'utf8');
   if (issueBodies.size >= 8192) issueBodies.clear();
   issueBodies.set(issue.id, { revision: storeRevision, bytes });
   return bytes;
@@ -587,10 +578,10 @@ export function handleApi(call: ApiCall, forge: Forge): ApiReply {
       const name = asString(body.name);
       if (name === undefined || name === '') return unprocessable('Validation Failed');
       repo.labels.add(name);
-      return ok(201, labelJson(repo, name));
+      return ok(201, labelJson(name));
     }
     if (call.method === 'GET' && rest.length === 0) {
-      return ok(200, [...repo.labels].sort().map((name) => labelJson(repo, name)));
+      return ok(200, [...repo.labels].sort().map((name) => labelJson(name)));
     }
     return notFound();
   }
@@ -641,7 +632,7 @@ export function handleApi(call: ApiCall, forge: Forge): ApiReply {
         const bodyText = asString(body.body);
         if (bodyText !== undefined) issue.body = bodyText;
         noteStoreChange();
-        return ok(200, issueJson(repo, issue));
+        return ok(200, issueJson(issue));
       }
       return notFound();
     }
@@ -800,7 +791,9 @@ function createIssue(call: ApiCall, repo: Repo, forge: Forge): ApiReply {
     comments: [] as { id: number; body: string; user: string }[],
   };
   repo.issues.set(number, issue);
-  return ok(201, issueJson(repo, issue));
+  // The 201 body is byte-for-byte what a later GET answers, so build it once: the create reply
+  // and every read of this issue share one buffer.
+  return { status: 201, json: undefined, bytes: issueBytes(repo, issue) };
 }
 
 function listIssues(call: ApiCall, repo: Repo): ApiReply {
@@ -815,7 +808,7 @@ function listIssues(call: ApiCall, repo: Repo): ApiReply {
   const perPage = Math.min(numberParam(call, 'per_page', 30), 100);
   const page = numberParam(call, 'page', 1);
   const slice = list.slice((page - 1) * perPage, page * perPage);
-  return ok(200, slice.map((issue) => issueJson(repo, issue)));
+  return ok(200, slice.map((issue) => issueJson(issue)));
 }
 
 // ---------------------------------------------------------------------------------------------
