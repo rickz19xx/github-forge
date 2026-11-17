@@ -1,0 +1,730 @@
+// restapi.ts — the `/api/v3` REST surface (the GitHub v3 subset the suite drives).
+//
+// Covered here: the API root and meta, the token's user, repository create/read/patch/delete/list,
+// the contents API (which is also how a repository gets its first commit), git refs, branches,
+// commits, labels and issues with comments. Every reply is JSON with an X-GitHub-Request-Id, an
+// absent token is 401, and an unknown route is a JSON 404.
+
+import {
+  buildTree,
+  hashObject,
+  isOid,
+  parseCommit,
+  parseTree,
+  type GitObject,
+  type TreeEntry,
+} from './gitcore.ts';
+import { STATE_EPOCH_ISO, STATE_EPOCH_SEC, type Forge, type Repo } from './gitstore.ts';
+import { users } from './scenario.ts';
+
+export interface ApiReply {
+  status: number;
+  json: unknown;
+  headers?: Record<string, string>;
+}
+
+/** One REST call, already split into what a handler needs. */
+export interface ApiCall {
+  method: string;
+  /** Decoded path segments after `/api/v3`. */
+  segments: string[];
+  query: Map<string, string>;
+  body: Buffer;
+  /** The token's login, or null for an anonymous call. */
+  login: string | null;
+  /** The origin the request arrived on, e.g. `http://127.0.0.1:41234`. */
+  origin: string;
+}
+
+/** Raised for a malformed body: the caller answers 400. */
+export class BadRequest extends Error {}
+
+const JSON_HEADERS: Record<string, string> = { 'content-type': 'application/json; charset=utf-8' };
+
+function ok(status: number, json: unknown, headers: Record<string, string> = {}): ApiReply {
+  return { status, json, headers: { ...headers } };
+}
+
+export function notFound(message = 'Not Found'): ApiReply {
+  return ok(404, { message });
+}
+
+export function unauthorized(): ApiReply {
+  return ok(401, { message: 'Requires authentication' });
+}
+
+export function unprocessable(message: string, errors?: unknown[]): ApiReply {
+  return ok(422, errors === undefined ? { message } : { message, errors });
+}
+
+// ---------------------------------------------------------------------------------------------
+// users and repositories
+// ---------------------------------------------------------------------------------------------
+
+interface UserView {
+  login: string;
+  id: number;
+  node_id: string;
+  name: string;
+  email: string;
+}
+
+function userView(login: string): UserView {
+  const known = users().find((user) => user.login === login);
+  if (known !== undefined) return { login: known.login, id: known.id, node_id: `U_${known.id}`, name: known.name, email: known.email };
+  let hash = 2166136261;
+  for (let i = 0; i < login.length; i += 1) {
+    hash ^= login.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  const id = 100_000 + (hash % 900_000);
+  return { login, id, node_id: `U_${id}`, name: login, email: `${login}@example.invalid` };
+}
+
+function userJson(login: string): Record<string, unknown> {
+  const view = userView(login);
+  return {
+    login: view.login,
+    id: view.id,
+    node_id: view.node_id,
+    avatar_url: `${''}https://avatars.example.invalid/u/${view.id}`,
+    gravatar_id: '',
+    url: `https://api.example.invalid/users/${view.login}`,
+    html_url: `https://example.invalid/${view.login}`,
+    type: 'User',
+    site_admin: false,
+  };
+}
+
+/** GitHub's repository JSON. */
+function repoJson(call: ApiCall, repo: Repo): Record<string, unknown> {
+  const base = `${call.origin}/api/v3`;
+  return {
+    id: repo.id,
+    node_id: `R_${repo.id}`,
+    name: repo.name,
+    full_name: `${repo.owner}/${repo.name}`,
+    private: repo.isPrivate,
+    owner: userJson(repo.owner),
+    html_url: `${call.origin}/${repo.owner}/${repo.name}`,
+    description: repo.description,
+    fork: false,
+    url: `${base}/repos/${repo.owner}/${repo.name}`,
+    archive_url: `${base}/repos/${repo.owner}/${repo.name}/{archive_format}{/ref}`,
+    contents_url: `${base}/repos/${repo.owner}/${repo.name}/contents/{+path}`,
+    issues_url: `${base}/repos/${repo.owner}/${repo.name}/issues{/number}`,
+    branches_url: `${base}/repos/${repo.owner}/${repo.name}/branches{/branch}`,
+    default_branch: repo.defaultBranch,
+    created_at: STATE_EPOCH_ISO,
+    updated_at: STATE_EPOCH_ISO,
+    pushed_at: STATE_EPOCH_ISO,
+    size: 0,
+    language: null,
+    visibility: repo.isPrivate ? 'private' : 'public',
+    has_issues: true,
+    has_wiki: false,
+    has_pages: false,
+    has_projects: false,
+    archived: false,
+    disabled: false,
+    open_issues_count: repo.issues.size,
+    open_issues: repo.issues.size,
+    forks_count: 0,
+    forks: 0,
+    stargazers_count: 0,
+    watchers_count: 0,
+    watchers: 0,
+    subscribers_count: 0,
+    network_count: 0,
+    size_kb: 0,
+    topics: [],
+    license: null,
+    permissions: { admin: true, maintain: true, push: true, triage: true, pull: true },
+  };
+}
+
+/** The token's own user JSON. */
+function viewerJson(call: ApiCall): Record<string, unknown> {
+  const view = userView(call.login as string);
+  return {
+    login: view.login,
+    id: view.id,
+    node_id: view.node_id,
+    name: view.name,
+    email: view.email,
+    type: 'User',
+    site_admin: false,
+    public_repos: 0,
+    followers: 0,
+    following: 0,
+    created_at: STATE_EPOCH_ISO,
+    updated_at: STATE_EPOCH_ISO,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// the git plumbing the contents API needs
+// ---------------------------------------------------------------------------------------------
+
+/** The tree entry at `segments` under `treeOid`, or null. */
+function entryAt(repo: Repo, treeOid: string, segments: readonly string[]): TreeEntry | null {
+  let current = treeOid;
+  for (let index = 0; index < segments.length; index += 1) {
+    const object = repo.objects.get(current);
+    if (!object || object.type !== 'tree') return null;
+    const entry = parseTree(object.data).find((candidate) => candidate.name === segments[index]);
+    if (!entry) return null;
+    if (index === segments.length - 1) return entry;
+    current = entry.oid;
+  }
+  return null;
+}
+
+/** The blob at `segments`, or null when the path is not a file. */
+function blobAt(repo: Repo, treeOid: string, segments: readonly string[]): { oid: string; data: Buffer } | null {
+  const entry = entryAt(repo, treeOid, segments);
+  if (entry === null || entry.mode === '40000') return null;
+  const object = repo.objects.get(entry.oid);
+  if (!object || object.type !== 'blob') return null;
+  return { oid: entry.oid, data: object.data };
+}
+
+function storeObject(repo: Repo, object: GitObject): string {
+  const oid = hashObject(object.type, object.data);
+  if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+  return oid;
+}
+
+/** Write a blob at `segments`, creating the trees on the way up. Returns the new root tree id. */
+function writePath(repo: Repo, rootTree: string | null, segments: readonly string[], blobOid: string): string {
+  const name = segments[0] as string;
+  let entries: TreeEntry[] = [];
+  if (rootTree !== null) {
+    const object = repo.objects.get(rootTree);
+    if (object && object.type === 'tree') entries = parseTree(object.data).filter((entry) => entry.name !== name);
+  }
+  if (segments.length === 1) {
+    entries.push({ mode: '100644', name, oid: blobOid });
+  } else {
+    const existing = rootTree === null ? null : entryAt(repo, rootTree, [name]);
+    const childBase = existing !== null && existing.mode === '40000' ? existing.oid : null;
+    const child = writePath(repo, childBase, segments.slice(1), blobOid);
+    entries.push({ mode: '40000', name, oid: child });
+  }
+  return storeObject(repo, { type: 'tree', data: buildTree(entries) });
+}
+
+/** Remove `segments`; null when nothing is left at all. */
+function removePath(repo: Repo, rootTree: string, segments: readonly string[]): string | null {
+  const name = segments[0] as string;
+  const object = repo.objects.get(rootTree);
+  if (!object || object.type !== 'tree') return null;
+  const entries = parseTree(object.data);
+  const entry = entries.find((candidate) => candidate.name === name);
+  if (!entry) return null;
+  if (segments.length === 1) {
+    const kept = entries.filter((candidate) => candidate.name !== name);
+    if (kept.length === 0) return '';
+    return storeObject(repo, { type: 'tree', data: buildTree(kept) });
+  }
+  if (entry.mode !== '40000') return null;
+  const child = removePath(repo, entry.oid, segments.slice(1));
+  if (child === null) return null;
+  const kept = entries.filter((candidate) => candidate.name !== name);
+  if (child !== '') kept.push({ mode: '40000', name, oid: child });
+  if (kept.length === 0) return '';
+  return storeObject(repo, { type: 'tree', data: buildTree(kept) });
+}
+
+/** Build and store a commit; the returned id is its content hash. */
+function makeCommit(repo: Repo, treeOid: string, parents: readonly string[], message: string, login: string): string {
+  const view = userView(login);
+  const identity = `${view.name} <${view.email}> ${STATE_EPOCH_SEC} +0000`;
+  const body = message.endsWith('\n') ? message : `${message}\n`;
+  const lines = [`tree ${treeOid}`];
+  for (const parent of parents) lines.push(`parent ${parent}`);
+  lines.push(`author ${identity}`, `committer ${identity}`, '', body);
+  return storeObject(repo, { type: 'commit', data: Buffer.from(lines.join('\n'), 'utf8') });
+}
+
+/** Resolve a ref name, branch name, tag name or raw object id to a commit id (or the object it names). */
+function resolveRef(repo: Repo, ref: string): string | null {
+  const direct = repo.refs.get(ref);
+  if (direct !== undefined) return direct;
+  for (const candidate of [`refs/heads/${ref}`, `refs/tags/${ref}`]) {
+    const oid = repo.refs.get(candidate);
+    if (oid !== undefined) return oid;
+  }
+  return isOid(ref) && repo.objects.has(ref) ? ref : null;
+}
+
+/** The commit id a ref-ish name resolves to, following annotated tags. */
+function resolveCommit(repo: Repo, refish: string): string | null {
+  let oid = resolveRef(repo, refish);
+  for (let hop = 0; oid !== null && hop < 16; hop += 1) {
+    const object = repo.objects.get(oid);
+    if (!object) return null;
+    if (object.type === 'commit') return oid;
+    if (object.type !== 'tag') return null;
+    oid = parseTagObject(object.data);
+    if (oid === '') return null;
+  }
+  return null;
+}
+
+/** The object a tag points at, from its bytes. */
+function parseTagObject(data: Buffer): string {
+  const blank = data.indexOf('\n\n');
+  const header = data.toString('utf8', 0, blank < 0 ? data.length : blank);
+  for (const line of header.split('\n')) {
+    if (line.startsWith('object ')) return line.slice(7).trim();
+  }
+  return '';
+}
+
+/** The tree of the commit a refish names, or null. */
+function treeOf(repo: Repo, refish: string): string | null {
+  const commitOid = resolveCommit(repo, refish);
+  if (commitOid === null) return null;
+  const object = repo.objects.get(commitOid);
+  return object === undefined ? null : parseCommit(object.data).tree;
+}
+
+const BASE64_WRAP = 60;
+
+function base64Wrapped(data: Buffer): string {
+  const encoded = data.toString('base64');
+  const parts: string[] = [];
+  for (let offset = 0; offset < encoded.length; offset += BASE64_WRAP) parts.push(encoded.slice(offset, offset + BASE64_WRAP));
+  return `${parts.join('\n')}\n`;
+}
+
+function fileJson(call: ApiCall, repo: Repo, path: string, oid: string, data: Buffer): Record<string, unknown> {
+  const name = path.split('/').pop() as string;
+  const base = `${call.origin}/api/v3/repos/${repo.owner}/${repo.name}/contents`;
+  return {
+    type: 'file',
+    encoding: 'base64',
+    size: data.length,
+    name,
+    path,
+    content: base64Wrapped(data),
+    sha: oid,
+    url: `${base}/${path}?ref=${repo.defaultBranch}`,
+    git_url: `${call.origin}/${repo.owner}/${repo.name}/git/blobs/${oid}`,
+    html_url: `${call.origin}/${repo.owner}/${repo.name}/blob/${repo.defaultBranch}/${path}`,
+    download_url: `${call.origin}/${repo.owner}/${repo.name}/raw/${repo.defaultBranch}/${path}`,
+    _links: { self: `${base}/${path}`, git: `${call.origin}/${repo.owner}/${repo.name}/git/blobs/${oid}`, html: `${call.origin}/${repo.owner}/${repo.name}/blob/${repo.defaultBranch}/${path}` },
+  };
+}
+
+function dirJson(call: ApiCall, repo: Repo, path: string, entry: TreeEntry): Record<string, unknown> {
+  const childPath = path === '' ? entry.name : `${path}/${entry.name}`;
+  const base = `${call.origin}/api/v3/repos/${repo.owner}/${repo.name}/contents`;
+  const isDir = entry.mode === '40000';
+  const object = repo.objects.get(entry.oid);
+  return {
+    type: isDir ? 'dir' : 'file',
+    size: !isDir && object ? object.data.length : 0,
+    name: entry.name,
+    path: childPath,
+    sha: entry.oid,
+    url: `${base}/${childPath}`,
+    git_url: `${call.origin}/${repo.owner}/${repo.name}/git/${isDir ? 'trees' : 'blobs'}/${entry.oid}`,
+    html_url: `${call.origin}/${repo.owner}/${repo.name}/${isDir ? 'tree' : 'blob'}/${repo.defaultBranch}/${childPath}`,
+    download_url: isDir ? null : `${call.origin}/${repo.owner}/${repo.name}/raw/${repo.defaultBranch}/${childPath}`,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// issues
+// ---------------------------------------------------------------------------------------------
+
+function labelJson(repo: Repo, name: string): Record<string, unknown> {
+  let hash = 2166136261;
+  for (let i = 0; i < name.length; i += 1) {
+    hash ^= name.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return { id: (hash % 100000) + 1, node_id: `L_${hash % 100000}`, name, color: 'ededed', default: true, description: null, url: '' };
+}
+
+function issueJson(repo: Repo, issue: { number: number; id: number; title: string; body: string; state: string; labels: string[]; user: string; comments: { id: number }[] }): Record<string, unknown> {
+  return {
+    id: issue.id,
+    node_id: `I_${issue.id}`,
+    number: issue.number,
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    state_reason: null,
+    locked: false,
+    labels: issue.labels.map((name) => labelJson(repo, name)),
+    assignee: null,
+    assignees: [],
+    milestone: null,
+    comments: issue.comments.length,
+    user: userJson(issue.user),
+    created_at: STATE_EPOCH_ISO,
+    updated_at: STATE_EPOCH_ISO,
+    closed_at: issue.state === 'closed' ? STATE_EPOCH_ISO : null,
+    url: '',
+    repository_url: '',
+    html_url: '',
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// routing
+// ---------------------------------------------------------------------------------------------
+
+function parseJsonBody(call: ApiCall): Record<string, unknown> {
+  if (call.body.length === 0) return {};
+  const text = call.body.toString('utf8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new BadRequest('Problems parsing JSON');
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new BadRequest('Problems parsing JSON');
+  return parsed as Record<string, unknown>;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function numberParam(call: ApiCall, name: string, fallback: number): number {
+  const raw = call.query.get(name);
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** A repository the token may see: 404 for a foreign or missing one. */
+function visibleRepo(call: ApiCall, forge: Forge, owner: string, name: string): ApiReply | Repo {
+  const repo = forge.get(owner, name);
+  if (repo === undefined) return notFound();
+  if (call.login !== null && repo.owner.toLowerCase() !== call.login.toLowerCase()) return notFound();
+  return repo;
+}
+
+function isRepo(value: ApiReply | Repo): value is Repo {
+  return (value as Repo).objects !== undefined;
+}
+
+/** The `/api/v3` entry point. */
+export function handleApi(call: ApiCall, forge: Forge): ApiReply {
+  const [head, second, third, fourth, ...rest] = call.segments;
+
+  // The API root and meta need no token.
+  if (call.segments.length === 0 || (call.segments.length === 1 && call.segments[0] === '')) {
+    if (call.method !== 'GET') return notFound();
+    return ok(200, { current_user_url: `${call.origin}/api/v3/user`, rate_limit_url: `${call.origin}/api/v3/rate_limit` }, { 'x-oauth-scopes': 'repo, read:org' });
+  }
+  if (head === 'meta' && call.segments.length === 1) {
+    if (call.method !== 'GET') return notFound();
+    return ok(200, { installed_version: 'ghforge-1.0.0', verifiable_password_authentication: true });
+  }
+  if (head === 'rate_limit') return ok(200, { resources: {}, rate: { limit: 5000, remaining: 4999, reset: STATE_EPOCH_SEC } });
+
+  if (call.login === null) return unauthorized();
+
+  if (head === 'user') {
+    if (call.segments.length === 1) {
+      if (call.method !== 'GET') return notFound();
+      return ok(200, viewerJson(call));
+    }
+    if (second === 'repos') {
+      if (call.segments.length !== 2) return notFound();
+      if (call.method === 'POST') return createRepo(call, forge);
+      if (call.method === 'GET') return listRepos(call, forge);
+      return notFound();
+    }
+    if (second === 'orgs' && third === undefined) return ok(200, []);
+    return notFound();
+  }
+
+  if (head !== 'repos' || second === undefined || third === undefined) return notFound();
+  const found = visibleRepo(call, forge, second, third);
+  if (!isRepo(found)) return found;
+  const repo = found;
+
+  if (fourth === undefined) {
+    if (call.method === 'GET') return ok(200, repoJson(call, repo));
+    if (call.method === 'PATCH') {
+      const body = parseJsonBody(call);
+      const description = asString(body.description);
+      if (description !== undefined) repo.description = description;
+      if (typeof body.private === 'boolean') repo.isPrivate = body.private;
+      return ok(200, repoJson(call, repo));
+    }
+    if (call.method === 'DELETE') {
+      forge.remove(repo.owner, repo.name);
+      return { status: 204, json: undefined };
+    }
+    return notFound();
+  }
+
+  if (fourth === 'contents') return handleContents(call, repo, rest);
+
+  if (fourth === 'git' && rest[0] === 'refs') {
+    if (call.method !== 'POST') return notFound();
+    const body = parseJsonBody(call);
+    const ref = asString(body.ref);
+    const sha = asString(body.sha);
+    if (ref === undefined || sha === undefined || !isOid(sha)) return unprocessable('Validation Failed');
+    if (repo.refs.has(ref)) return unprocessable('Reference already exists');
+    repo.refs.set(ref, sha);
+    return ok(201, { ref, node_id: `MDM6UmVm${ref}`, url: '', object: { sha, type: 'commit', url: '' } });
+  }
+
+  if (fourth === 'branches' && rest.length === 0) {
+    const branches = [...repo.refs.keys()].filter((name) => name.startsWith('refs/heads/')).sort();
+    return ok(200, branches.map((name) => ({
+      name: name.slice('refs/heads/'.length),
+      commit: { sha: repo.refs.get(name), url: '' },
+      protected: false,
+    })));
+  }
+
+  if (fourth === 'commits' && rest.length === 0) {
+    const refish = call.query.get('sha') ?? repo.defaultBranch;
+    const tip = resolveCommit(repo, refish);
+    if (tip === null) return ok(200, []);
+    const max = numberParam(call, 'per_page', 100);
+    const out: unknown[] = [];
+    const seen = new Set<string>();
+    const queue = [tip];
+    while (queue.length > 0 && out.length < max) {
+      const oid = queue.shift() as string;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const object = repo.objects.get(oid);
+      if (!object || object.type !== 'commit') continue;
+      const commit = parseCommit(object.data);
+      const message = commit.message.endsWith('\n') ? commit.message.slice(0, -1) : commit.message;
+      out.push({
+        sha: oid,
+        node_id: `C_${oid}`,
+        commit: { message, comment_count: 0, tree: { sha: commit.tree, url: '' } },
+        url: `${call.origin}/api/v3/repos/${repo.owner}/${repo.name}/commits/${oid}`,
+        html_url: `${call.origin}/${repo.owner}/${repo.name}/commit/${oid}`,
+        parents: commit.parents.map((parent) => ({ sha: parent, url: '' })),
+      });
+      for (const parent of commit.parents) queue.push(parent);
+    }
+    return ok(200, out);
+  }
+
+  if (fourth === 'labels') {
+    if (call.method === 'POST' && rest.length === 0) {
+      const body = parseJsonBody(call);
+      const name = asString(body.name);
+      if (name === undefined || name === '') return unprocessable('Validation Failed');
+      repo.labels.add(name);
+      return ok(201, labelJson(repo, name));
+    }
+    if (call.method === 'GET' && rest.length === 0) {
+      return ok(200, [...repo.labels].sort().map((name) => labelJson(repo, name)));
+    }
+    return notFound();
+  }
+
+  if (fourth === 'issues') {
+    if (rest.length === 0) {
+      if (call.method === 'POST') return createIssue(call, repo, forge);
+      if (call.method === 'GET') return listIssues(call, repo);
+      return notFound();
+    }
+    const number = Number.parseInt(rest[0] as string, 10);
+    if (!Number.isFinite(number)) return notFound();
+    const issue = repo.issues.get(number);
+    if (issue === undefined) return notFound();
+    if (rest.length === 1) {
+      if (call.method === 'GET') return ok(200, issueJson(repo, issue));
+      if (call.method === 'PATCH') {
+        const body = parseJsonBody(call);
+        const state = asString(body.state);
+        if (state === 'open' || state === 'closed') issue.state = state;
+        const title = asString(body.title);
+        if (title !== undefined) issue.title = title;
+        const bodyText = asString(body.body);
+        if (bodyText !== undefined) issue.body = bodyText;
+        return ok(200, issueJson(repo, issue));
+      }
+      return notFound();
+    }
+    if (rest[1] === 'comments' && rest.length === 2) {
+      if (call.method === 'GET') {
+        return ok(200, issue.comments.map((comment) => ({ id: comment.id, node_id: `IC_${comment.id}`, body: comment.body, user: userJson(comment.user), created_at: STATE_EPOCH_ISO, updated_at: STATE_EPOCH_ISO })));
+      }
+      if (call.method === 'POST') {
+        const body = parseJsonBody(call);
+        const text = asString(body.body) ?? '';
+        const comment = { id: repo.nextCommentId, body: text, user: call.login as string };
+        repo.nextCommentId += 1;
+        issue.comments.push(comment);
+        return ok(201, { id: comment.id, node_id: `IC_${comment.id}`, body: comment.body, user: userJson(comment.user), created_at: STATE_EPOCH_ISO, updated_at: STATE_EPOCH_ISO });
+      }
+      return notFound();
+    }
+    return notFound();
+  }
+
+  return notFound();
+}
+
+// ---------------------------------------------------------------------------------------------
+// repositories
+// ---------------------------------------------------------------------------------------------
+
+function createRepo(call: ApiCall, forge: Forge): ApiReply {
+  const body = parseJsonBody(call);
+  const name = asString(body.name);
+  if (name === undefined || name.trim() === '') return unprocessable('Repository creation failed.', [{ resource: 'Repository', code: 'missing_field', field: 'name' }]);
+  const login = call.login as string;
+  const created = forge.create(login, name, {
+    description: asString(body.description) ?? '',
+    isPrivate: body.private === true,
+  });
+  if (created === null) return ok(422, { message: 'Repository creation failed. Name already exists on this account', errors: [{ resource: 'Repository', code: 'custom', field: 'name' }] });
+  return ok(201, repoJson(call, created));
+}
+
+function listRepos(call: ApiCall, forge: Forge): ApiReply {
+  const login = call.login as string;
+  const all = forge.listByOwner(login);
+  const perPage = Math.min(numberParam(call, 'per_page', 30), 100);
+  const page = numberParam(call, 'page', 1);
+  const slice = all.slice((page - 1) * perPage, page * perPage);
+  const links: string[] = [];
+  const path = `${call.origin}/api/v3/user/repos`;
+  const target = (p: number): string => `${path}?per_page=${perPage}&page=${p}`;
+  const lastPage = Math.max(1, Math.ceil(all.length / perPage));
+  if (page < lastPage) links.push(`<${target(page + 1)}>; rel="next"`, `<${target(lastPage)}>; rel="last"`);
+  if (page > 1) links.push(`<${target(page - 1)}>; rel="prev"`, `<${target(1)}>; rel="first"`);
+  const headers: Record<string, string> = {};
+  if (links.length > 0) headers.link = links.join(', ');
+  return ok(200, slice.map((repo) => repoJson(call, repo)), headers);
+}
+
+// ---------------------------------------------------------------------------------------------
+// contents
+// ---------------------------------------------------------------------------------------------
+
+function handleContents(call: ApiCall, repo: Repo, segments: readonly string[]): ApiReply {
+  const path = segments.join('/');
+  const branch = call.query.get('ref') ?? repo.defaultBranch;
+  const tree = treeOf(repo, branch);
+
+  if (call.method === 'GET') {
+    if (tree === null) return notFound();
+    if (path === '') {
+      const object = repo.objects.get(tree);
+      const entries = object ? parseTree(object.data) : [];
+      return ok(200, entries.map((entry) => dirJson(call, repo, '', entry)));
+    }
+    const entry = entryAt(repo, tree, segments);
+    if (entry === null) return notFound();
+    if (entry.mode === '40000') {
+      const object = repo.objects.get(entry.oid);
+      const entries = object ? parseTree(object.data) : [];
+      return ok(200, entries.map((child) => dirJson(call, repo, path, child)));
+    }
+    const object = repo.objects.get(entry.oid);
+    if (!object) return notFound();
+    return ok(200, fileJson(call, repo, path, entry.oid, object.data));
+  }
+
+  if (call.method === 'PUT') {
+    const body = parseJsonBody(call);
+    const message = asString(body.message);
+    const content = asString(body.content);
+    if (message === undefined) return unprocessable('Validation Failed', [{ resource: 'Commit', code: 'missing_field', field: 'message' }]);
+    if (content === undefined) return unprocessable('Validation Failed', [{ resource: 'File', code: 'missing_field', field: 'content' }]);
+    const data = Buffer.from(content.replace(/[\r\n\t ]+/g, ''), 'base64');
+    const targetBranch = asString(body.branch) ?? repo.defaultBranch;
+    const refName = `refs/heads/${targetBranch}`;
+    const parent = repo.refs.get(refName) ?? null;
+    const parentTree = parent === null ? null : parseCommit((repo.objects.get(parent) as GitObject).data).tree;
+    const expectedSha = asString(body.sha);
+    if (expectedSha !== undefined && parentTree !== null) {
+      const existing = blobAt(repo, parentTree, segments);
+      if (existing === null || existing.oid !== expectedSha) return ok(409, { message: 'sha does not match' });
+    }
+    const blobOid = storeObject(repo, { type: 'blob', data });
+    const newTree = writePath(repo, parentTree, segments, blobOid);
+    const commitOid = makeCommit(repo, newTree, parent === null ? [] : [parent], message, call.login as string);
+    repo.refs.set(refName, commitOid);
+    return ok(201, {
+      content: fileJson(call, repo, path, blobOid, data),
+      commit: { sha: commitOid, message, tree: { sha: newTree, url: '' }, parents: parent === null ? [] : [{ sha: parent }], url: '', html_url: '' },
+    });
+  }
+
+  if (call.method === 'DELETE') {
+    const body = parseJsonBody(call);
+    const message = asString(body.message) ?? `Delete ${path}`;
+    const parent = repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? null;
+    if (parent === null || tree === null) return notFound();
+    const parentTree = parseCommit((repo.objects.get(parent) as GitObject).data).tree;
+    const existing = blobAt(repo, parentTree, segments);
+    if (existing === null) return notFound();
+    const expectedSha = asString(body.sha);
+    if (expectedSha !== undefined && expectedSha !== existing.oid) return ok(409, { message: 'sha does not match' });
+    const pruned = removePath(repo, parentTree, segments);
+    if (pruned === null) return notFound();
+    const newTree = pruned === '' ? storeObject(repo, { type: 'tree', data: Buffer.alloc(0) }) : pruned;
+    const commitOid = makeCommit(repo, newTree, [parent], message, call.login as string);
+    repo.refs.set(`refs/heads/${repo.defaultBranch}`, commitOid);
+    return ok(200, { content: null, commit: { sha: commitOid, message, tree: { sha: newTree, url: '' }, parents: [{ sha: parent }] } });
+  }
+
+  return notFound();
+}
+
+// ---------------------------------------------------------------------------------------------
+// issues
+// ---------------------------------------------------------------------------------------------
+
+function createIssue(call: ApiCall, repo: Repo, forge: Forge): ApiReply {
+  const body = parseJsonBody(call);
+  const title = asString(body.title);
+  if (title === undefined || title === '') return unprocessable('Validation Failed', [{ resource: 'Issue', code: 'missing_field', field: 'title' }]);
+  const wanted = Array.isArray(body.labels) ? body.labels.map((label) => (typeof label === 'string' ? label : asString((label as Record<string, unknown>).name) ?? '')) : [];
+  const missing = wanted.filter((label) => !repo.labels.has(label));
+  if (missing.length > 0) {
+    return unprocessable('Validation Failed', missing.map((label) => ({ resource: 'Issue', code: 'invalid', field: 'labels' })));
+  }
+  const number = repo.nextIssueNumber;
+  repo.nextIssueNumber += 1;
+  const issue = {
+    number,
+    id: forge.issueId(),
+    title,
+    body: asString(body.body) ?? '',
+    state: 'open' as const,
+    labels: wanted,
+    user: call.login as string,
+    comments: [] as { id: number; body: string; user: string }[],
+  };
+  repo.issues.set(number, issue);
+  return ok(201, issueJson(repo, issue));
+}
+
+function listIssues(call: ApiCall, repo: Repo): ApiReply {
+  const state = call.query.get('state') ?? 'open';
+  const sort = call.query.get('sort') ?? 'created';
+  const direction = call.query.get('direction') ?? 'desc';
+  let list = [...repo.issues.values()];
+  if (state !== 'all') list = list.filter((issue) => issue.state === state);
+  if (sort === 'created' || sort === 'updated') {
+    list.sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
+  }
+  const perPage = Math.min(numberParam(call, 'per_page', 30), 100);
+  const page = numberParam(call, 'page', 1);
+  const slice = list.slice((page - 1) * perPage, page * perPage);
+  return ok(200, slice.map((issue) => issueJson(repo, issue)));
+}
