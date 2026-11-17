@@ -254,28 +254,18 @@ function headBlock(status: number, contentType: string | null, length: number, i
 }
 
 /**
- * Write one reply. A small body is copied behind its head into one buffer, so the peer sees a single
- * segment and one wake-up; a large body (a packfile) keeps its own buffer and goes out as one
- * writev instead of paying the copy.
+ * Write one reply: the head and the body as one writev. The body buffer is usually a cached or
+ * already-built buffer, so copying it behind the head would cost more (and make more garbage) than
+ * the second iovec does; `cork` keeps the pair in a single system call.
  */
-const SMALL_BODY = 4096;
 function writeReply(socket: Socket, reply: Reply): void {
   const withhold = reply.status === 204 || reply.contentLength !== undefined;
   const body = withhold ? EMPTY : reply.body;
   const length = reply.contentLength ?? body.length;
   const head = headBlock(reply.status, reply.contentType, length, nextRequestId(), reply);
-  if (body.length <= SMALL_BODY) {
-    // A latin1 write puts one byte per character, so the byte length is the string's length.
-    const headBytes = head.length;
-    const out = Buffer.allocUnsafe(headBytes + body.length);
-    out.write(head, 0, headBytes, 'latin1');
-    if (body.length > 0) body.copy(out, headBytes);
-    socket.write(out);
-    return;
-  }
   socket.cork();
   socket.write(head, 'latin1');
-  socket.write(body);
+  if (body.length > 0) socket.write(body);
   socket.uncork();
 }
 
