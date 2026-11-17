@@ -2,3 +2,4 @@
 node_modules/
 # the local test build of the Go forge (the committed binary is ./forge, linux/amd64)
 forge.exe
+forge.exe~
