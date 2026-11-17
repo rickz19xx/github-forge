@@ -23,12 +23,17 @@ export interface ApiReply {
   headers?: Record<string, string>;
 }
 
+/** A read-only view of a request's query string: `get` answers a parameter's value, or undefined. */
+export interface QueryBag {
+  get(name: string): string | undefined;
+}
+
 /** One REST call, already split into what a handler needs. */
 export interface ApiCall {
   method: string;
   /** Decoded path segments after `/api/v3`. */
   segments: string[];
-  query: Map<string, string>;
+  query: QueryBag;
   body: Buffer;
   /** The token's login, or null for an anonymous call. */
   login: string | null;
