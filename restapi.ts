@@ -391,10 +391,17 @@ function issueJson(repo: Repo, issue: { number: number; id: number; title: strin
 // ---------------------------------------------------------------------------------------------
 
 /**
- * A revision of the whole store, bumped by every request that is not a GET. A cached read body is
- * only reused while the revision it was built at is still current, so no answer can go stale.
+ * A revision of the whole store, bumped by every request that is not a read. A cached read body is
+ * only reused while the revision it was built at is still current, so no answer can go stale - and
+ * `noteStoreChange` is called from the dispatch for every mutating method on every surface, so a
+ * write through GraphQL or MCP invalidates a REST read the same way a REST write does.
  */
 let storeRevision = 0;
+
+/** Note that a request may have changed the store: every cached read body is now stale. */
+export function noteStoreChange(): void {
+  storeRevision += 1;
+}
 
 /** Issue bodies, keyed by issue id: a read of an unchanged issue is one Map hit and one write. */
 const issueBodies = new Map<number, { revision: number; bytes: Buffer }>();
@@ -448,11 +455,6 @@ function isRepo(value: ApiReply | Repo): value is Repo {
 /** The `/api/v3` entry point. */
 export function handleApi(call: ApiCall, forge: Forge): ApiReply {
   const [head, second, third, fourth, ...rest] = call.segments;
-  // Anything that is not a read may change what a cached read body would say.
-  if (call.method !== 'GET') {
-    storeRevision += 1;
-    issueBodies.clear();
-  }
 
   // The API root and meta need no token.
   if (call.segments.length === 0 || (call.segments.length === 1 && call.segments[0] === '')) {
@@ -638,8 +640,7 @@ export function handleApi(call: ApiCall, forge: Forge): ApiReply {
         if (title !== undefined) issue.title = title;
         const bodyText = asString(body.body);
         if (bodyText !== undefined) issue.body = bodyText;
-        storeRevision += 1;
-        issueBodies.clear();
+        noteStoreChange();
         return ok(200, issueJson(repo, issue));
       }
       return notFound();

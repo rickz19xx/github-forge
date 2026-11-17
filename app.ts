@@ -11,7 +11,7 @@ import type { Server } from 'node:net';
 import { createHash } from 'node:crypto';
 import { handleReceivePack, handleUploadPack, handleInfoRefs, WireError, type WireResponse } from './gitwire.ts';
 import { Forge, type Repo } from './gitstore.ts';
-import { BadRequest, handleApi, type ApiCall, type ApiReply, type QueryBag } from './restapi.ts';
+import { BadRequest, handleApi, noteStoreChange, type ApiCall, type ApiReply, type QueryBag } from './restapi.ts';
 import { executeDocument, parseGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { viewerLogin } from './scenario.ts';
@@ -178,6 +178,9 @@ export function createDispatch(): Dispatch {
   const dispatch = (req: RawRequest): Reply => {
     const pathname = req.path;
     const method = req.method;
+    // A method that is not a read may change the store on any surface (REST, GraphQL, MCP), so one
+    // note here invalidates the cached read bodies before anything below can answer one.
+    if (method !== 'GET' && method !== 'HEAD') noteStoreChange();
 
     try {
       // The env's boot check: 200 {"ok":true}.
