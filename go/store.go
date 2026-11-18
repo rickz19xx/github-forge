@@ -165,7 +165,9 @@ type Forge struct {
 	nextRepo int
 	nextIss  int
 	nextPull int
-	rev      int64
+	// rev counts store changes. It is read without the write lock when a cached read decides
+	// whether it is still fresh, so it is atomic: a plain int64 there would be a data race.
+	rev atomic.Int64
 }
 
 func newForge() *Forge {
@@ -347,7 +349,7 @@ func (f *Forge) pullID() int {
 
 // noteChange marks the store as changed: every cached read body is now stale.
 func (f *Forge) noteChange() {
-	f.rev++
+	f.rev.Add(1)
 }
 
 func lowerAscii(value string) string {

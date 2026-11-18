@@ -602,8 +602,14 @@ func buildIssueReply(issue *Issue) *cachedReply {
 }
 
 // issueReplies is the repository's prebuilt issue replies, rebuilt when the store has changed.
+//
+// A reader may call this holding only the shared lock, so two of them can rebuild at once and a
+// push can bump the revision mid-rebuild. The table is published with CompareAndSwap on the
+// revision: a table built from an older revision can never replace a newer one, so a GET after a
+// write can never be answered from pre-write data.
 func (f *Forge) issueReplies(repo *Repo) *issueTable {
-	if table := repo.issueCache.Load(); table != nil && table.rev == f.rev {
+	rev := f.rev.Load()
+	if table := repo.issueCache.Load(); table != nil && table.rev == rev {
 		return table
 	}
 	highest := 0
@@ -616,9 +622,16 @@ func (f *Forge) issueReplies(repo *Repo) *issueTable {
 	for number, issue := range repo.issues {
 		rows[number] = buildIssueReply(issue)
 	}
-	table := &issueTable{rev: f.rev, rows: rows}
-	repo.issueCache.Store(table)
-	return table
+	fresh := &issueTable{rev: rev, rows: rows}
+	for {
+		current := repo.issueCache.Load()
+		if current != nil && current.rev >= rev {
+			return current
+		}
+		if repo.issueCache.CompareAndSwap(current, fresh) {
+			return fresh
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
