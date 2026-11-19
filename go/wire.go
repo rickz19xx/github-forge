@@ -678,6 +678,17 @@ func isAncestor(repo *Repo, ancestor, descendant oid) bool {
 	if ancestor == descendant {
 		return true
 	}
+	// Fast path: a fast-forward push's new commit names the old tip directly as a parent,
+	// so answer that without allocating the walk's seen map and queue.
+	if object := repo.objects[descendant]; object != nil && object.typ == typeCommit {
+		if commit, err := parseCommit(object.data); err == nil {
+			for _, parent := range commit.parents {
+				if parent == ancestor {
+					return true
+				}
+			}
+		}
+	}
 	seen := make(map[oid]struct{}, 64)
 	queue := make([]oid, 0, 64)
 	queue = append(queue, descendant)
