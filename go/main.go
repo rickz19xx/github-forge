@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,11 @@ const (
 )
 
 func main() {
+	// The forge's heap is small and steady (the store, the reply caches, per-connection
+	// buffers): a higher GC target trades a few MiB of resident memory for fewer GC cycles
+	// on the request path. The pod's limit is 1 GiB; this stays far below it.
+	debug.SetGCPercent(300)
+
 	origin := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
 	if origin == "" {
 		fmt.Fprintln(os.Stderr, "[entry] MAKEFUN_ENV_URL is unset: there is no env to register with")

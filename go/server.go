@@ -169,11 +169,12 @@ func (s *Server) ListenAndServe(listener net.Listener) {
 // conn is one client connection and its reusable buffers.
 type conn struct {
 	net.Conn
-	reader  *bufio.Reader
-	headBuf []byte
-	bodyBuf []byte
-	scratch []byte
-	request request
+	reader   *bufio.Reader
+	headBuf  []byte
+	bodyBuf  []byte
+	scratch  []byte
+	headCopy []byte
+	request  request
 }
 
 func (s *Server) serveConn(raw net.Conn) {
@@ -392,47 +393,57 @@ func quoteJSON(s string) string {
 	return string(appendJSONString(nil, s))
 }
 
-// writeResponse puts one reply on the wire in one write.
+// writeResponse puts one reply on the wire.
 func (c *conn) writeResponse(reply *response, isHead bool, id uint64) error {
-	out := c.scratch[:0]
 	hide := isHead || reply.status == 204
 	if reply.cached != nil {
-		out = append(out, reply.cached.head...)
-		putHex20(out[reply.cached.headIDOff:], id)
-		if !hide {
-			out = append(out, reply.cached.body...)
+		// The cached head is shared between requests: copy it (small), fill this request's
+		// id, and writev head and body straight from the cache — the body is never copied.
+		n := len(reply.cached.head)
+		if cap(c.headCopy) < n {
+			c.headCopy = make([]byte, n, n+64)
 		}
-	} else {
-		out = appendStatus(out, reply.status)
-		if reply.ctype != "" {
-			out = append(out, "content-type: "...)
-			out = append(out, reply.ctype...)
-			out = append(out, '\r', '\n')
+		head := c.headCopy[:n]
+		copy(head, reply.cached.head)
+		putHex20(head[reply.cached.headIDOff:], id)
+		if hide {
+			_, err := c.Conn.Write(head)
+			return err
 		}
-		length := len(reply.body)
-		if reply.entityLength > 0 {
-			length = reply.entityLength
-		}
-		out = append(out, "content-length: "...)
-		out = appendInt(out, length)
-		out = append(out, "\r\nx-github-request-id: "...)
-		var idBytes [20]byte
-		putHex20(idBytes[:], id)
-		out = append(out, idBytes[:]...)
+		buffers := net.Buffers{head, reply.cached.body}
+		_, err := buffers.WriteTo(c.Conn)
+		return err
+	}
+	out := c.scratch[:0]
+	out = appendStatus(out, reply.status)
+	if reply.ctype != "" {
+		out = append(out, "content-type: "...)
+		out = append(out, reply.ctype...)
 		out = append(out, '\r', '\n')
-		if reply.cacheControl {
-			out = append(out, "cache-control: no-cache, max-age=0, must-revalidate\r\n"...)
-		}
-		for _, extra := range reply.extra {
-			out = append(out, extra.name...)
-			out = append(out, ": "...)
-			out = append(out, extra.value...)
-			out = append(out, '\r', '\n')
-		}
+	}
+	length := len(reply.body)
+	if reply.entityLength > 0 {
+		length = reply.entityLength
+	}
+	out = append(out, "content-length: "...)
+	out = appendInt(out, length)
+	out = append(out, "\r\nx-github-request-id: "...)
+	var idBytes [20]byte
+	putHex20(idBytes[:], id)
+	out = append(out, idBytes[:]...)
+	out = append(out, '\r', '\n')
+	if reply.cacheControl {
+		out = append(out, "cache-control: no-cache, max-age=0, must-revalidate\r\n"...)
+	}
+	for _, extra := range reply.extra {
+		out = append(out, extra.name...)
+		out = append(out, ": "...)
+		out = append(out, extra.value...)
 		out = append(out, '\r', '\n')
-		if !hide && len(reply.body) > 0 {
-			out = append(out, reply.body...)
-		}
+	}
+	out = append(out, '\r', '\n')
+	if !hide && len(reply.body) > 0 {
+		out = append(out, reply.body...)
 	}
 	_, err := c.Conn.Write(out)
 	c.scratch = out[:0]
